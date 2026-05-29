@@ -2,7 +2,7 @@
 
 Markdown-first memory layer for LLM agents. One static call enhances a prompt with the relevant facts from your memory store. A separate supervisor worker handles all writes — extracting new facts from queued conversations, refreshing the search index across every configured database, and periodically compacting duplicates and obsolete entries. Memory entries are plain `.md` files with a tiny YAML frontmatter — readable, editable, git-versionable. The search index is replicated across as many SQLite, MySQL and PostgreSQL backends as you list in `config.yaml`.
 
-## Installation
+## installation
 
 ```bash
 composer require vielhuber/memhelper
@@ -39,7 +39,7 @@ input_dbs:
       database: memhelper
 ```
 
-## Usage
+## usage
 
 ```php
 use vielhuber\memhelper\memhelper;
@@ -47,7 +47,7 @@ use vielhuber\memhelper\memhelper;
 $prompt = memhelper::enhance($conversation) . $prompt;
 ```
 
-## Worker
+## worker
 
 ```ini
 [program:memhelper-worker]
@@ -56,9 +56,8 @@ autostart=true
 autorestart=true
 ```
 
-## Tests
+## tests
 
 ```bash
-composer install
-vendor/bin/phpunit
+./vendor/bin/phpunit
 ```
