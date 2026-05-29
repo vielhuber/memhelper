@@ -1,0 +1,41 @@
+#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+
+foreach (
+    [
+        __DIR__ . '/../vendor/autoload.php',     // local development
+        __DIR__ . '/../../../autoload.php',      // installed via composer
+        __DIR__ . '/../../../../autoload.php'    // alternative composer path
+    ]
+    as $autoload_path
+) {
+    if (is_file($autoload_path)) {
+        require_once $autoload_path;
+        break;
+    }
+}
+
+use vielhuber\memhelper\memhelper;
+
+// supervisord typically passes the polling interval as the first arg; fall
+// back to 30 s when no value is given. clamp to >=1 s so a misconfiguration
+// can't tight-loop the box.
+$interval = max(1, (int) ($argv[1] ?? 30));
+
+if (function_exists('pcntl_async_signals')) {
+    pcntl_async_signals(true);
+    pcntl_signal(SIGTERM, static fn(): never => exit(0));
+    pcntl_signal(SIGINT, static fn(): never => exit(0));
+}
+
+fwrite(STDOUT, '[' . date('c') . '] memhelper-worker starting (interval=' . $interval . 's)' . PHP_EOL);
+
+while (true) {
+    try {
+        memhelper::work();
+    } catch (\Throwable $e) {
+        fwrite(STDERR, '[' . date('c') . '] error: ' . $e->getMessage() . PHP_EOL);
+    }
+    sleep($interval);
+}

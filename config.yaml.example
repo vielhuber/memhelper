@@ -1,0 +1,28 @@
+ai:
+    provider: openai
+    model: gpt-5
+    api_key: sk-...
+
+output: /path/to/memory
+
+input_files:
+    - /path/to/memory/attached
+    - /path/to/extra/docs
+
+input_dbs:
+    - driver: sqlite
+      path: /path/to/memhelper.db
+
+    - driver: mysql
+      host: 127.0.0.1
+      port: 3306
+      user: root
+      password:
+      database: memhelper
+
+    - driver: postgres
+      host: 127.0.0.1
+      port: 5432
+      user: postgres
+      password:
+      database: memhelper

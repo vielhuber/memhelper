@@ -1,0 +1,30 @@
+{
+    "name": "vielhuber/memhelper",
+    "description": "Markdown-first memory layer for LLM agents — one call, transparent indexing and auto-extraction.",
+    "license": "MIT",
+    "require": {
+        "php": "^8.3",
+        "ext-pdo": "*",
+        "ext-json": "*",
+        "symfony/yaml": "^7.0",
+        "vielhuber/aihelper": "*",
+        "vielhuber/dbhelper": "*"
+    },
+    "suggest": {
+        "ext-pdo_sqlite": "For SQLite-backed FTS5 search index",
+        "ext-pdo_mysql": "For MySQL FULLTEXT search backend",
+        "ext-pdo_pgsql": "For PostgreSQL tsvector search backend",
+        "poppler-utils": "Provides pdftotext for indexing PDFs"
+    },
+    "autoload": {
+        "psr-4": {
+            "vielhuber\\memhelper\\": "src/"
+        }
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^13"
+    },
+    "bin": [
+        "bin/memhelper-worker"
+    ]
+}
