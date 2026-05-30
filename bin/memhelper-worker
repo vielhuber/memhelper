@@ -26,12 +26,15 @@ if (function_exists('pcntl_async_signals')) {
     pcntl_signal(SIGINT, static fn(): never => exit(0));
 }
 
-// the first argv is the absolute path to the memhelper config yaml.
+// argv[1]: config.yaml path (required)
+// argv[2]: log file path (optional) — when set the worker writes detailed
+//          progress to that file in addition to stderr.
 if (!isset($argv[1]) || $argv[1] === '') {
-    fwrite(STDERR, 'usage: memhelper-worker <path-to-config.yaml>' . PHP_EOL);
+    fwrite(STDERR, 'usage: memhelper-worker <path-to-config.yaml> [<path-to-log.log>]' . PHP_EOL);
     exit(2);
 }
-$mem = new memhelper((string) $argv[1]);
+$logPath = isset($argv[2]) && $argv[2] !== '' ? (string) $argv[2] : null;
+$mem = new memhelper((string) $argv[1], $logPath);
 
 fwrite(STDOUT, '[' . date('c') . '] memhelper-worker starting (interval=' . INTERVAL_SECONDS . 's)' . PHP_EOL);
 

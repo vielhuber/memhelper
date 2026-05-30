@@ -31,13 +31,18 @@ final class memhelper
     private ?aihelper $ai = null;
     /** @var list<array{driver: string, db: dbhelper}> */
     private array $dbs = [];
+    private ?string $logPath = null;
 
     /**
      * The host must point the constructor at the absolute path of its
-     * memhelper yaml — there is no implicit discovery.
+     * memhelper yaml — there is no implicit discovery. The optional second
+     * argument enables verbose logging to that file (append mode); messages
+     * are additionally written to stderr when running under the CLI SAPI so
+     * supervisord-managed processes surface them too.
      */
-    public function __construct(string $configPath)
+    public function __construct(string $configPath, ?string $logPath = null)
     {
+        $this->logPath = $logPath !== null && $logPath !== '' ? $logPath : null;
         $cfg = self::config($configPath);
 
         $output = (string) ($cfg['output'] ?? '');
@@ -99,6 +104,50 @@ final class memhelper
         }
     }
 
+    /**
+     * Append a line to the log file (when configured) and mirror to stderr
+     * under the CLI SAPI so supervisord captures it too. Best-effort — write
+     * failures are silent so logging cannot abort a tick.
+     */
+    private function log(string $msg, string $level = 'INFO'): void
+    {
+        $line = '[' . date('c') . '] [' . $level . '] ' . $msg . PHP_EOL;
+        if ($this->logPath !== null) {
+            @file_put_contents($this->logPath, $line, FILE_APPEND);
+        }
+        if (PHP_SAPI === 'cli') {
+            @fwrite(STDERR, $line);
+        }
+    }
+
+    /** @var array<string, array{lastTime: float, lastDone: int}> */
+    private array $progressState = [];
+
+    /**
+     * Throttled progress reporter — emits at most one line per ~2 s or per
+     * 10 processed items, plus a final line on completion. Keeps the log
+     * readable on initial bulk indexing of thousands of files without
+     * losing visibility of where you are.
+     */
+    private function progress(string $tag, int $done, int $total, string $note): void
+    {
+        if ($total <= 0) {
+            return;
+        }
+        $now = microtime(true);
+        $state = $this->progressState[$tag] ?? ['lastTime' => 0.0, 'lastDone' => 0];
+        $emit =
+            $done === $total ||
+            $done - $state['lastDone'] >= 10 ||
+            $now - $state['lastTime'] >= 2.0;
+        if (!$emit) {
+            return;
+        }
+        $pct = (int) round($done * 100 / $total);
+        $this->log(sprintf('%s: [%d/%d] (%d%%) %s', $tag, $done, $total, $pct, $note));
+        $this->progressState[$tag] = ['lastTime' => $now, 'lastDone' => $done];
+    }
+
     private static function config(string $configPath): array
     {
         if ($configPath === '' || !is_file($configPath)) {
@@ -142,6 +191,13 @@ final class memhelper
         if ($normalized !== []) {
             $this->enqueueConversation($normalized);
         }
+        $this->log(sprintf(
+            'enhance: turns=%d query=%dB hits=%d block=%dB',
+            count($normalized),
+            strlen($query),
+            count($hits),
+            strlen($block)
+        ));
         return $block;
     }
 
@@ -253,11 +309,47 @@ final class memhelper
      */
     public function work(): void
     {
-        $this->processQueue();
-        $this->refreshIndexes();
-        if ($this->shouldCompact()) {
-            $this->compact();
-            $this->markCompacted();
+        // file-based lock — flock is atomic and the OS releases the lock when
+        // the process dies, so a crash mid-tick can't leave a stale sentinel.
+        // a long-running tick (initial bulk index, big compaction) makes the
+        // next 30 s polling cycle find the lock taken and exit silently.
+        $dataDir = $this->dataDir();
+        if (!is_dir($dataDir) && !@mkdir($dataDir, 0775, true) && !is_dir($dataDir)) {
+            $this->log('failed to create data dir: ' . $dataDir, 'ERROR');
+            return;
+        }
+        $lockPath = $dataDir . '/tick.lock';
+        $fp = @fopen($lockPath, 'c');
+        if ($fp === false) {
+            $this->log('failed to open tick.lock', 'ERROR');
+            return;
+        }
+        if (!flock($fp, LOCK_EX | LOCK_NB)) {
+            $this->log('another tick is still running, skipping');
+            fclose($fp);
+            return;
+        }
+        $tStart = microtime(true);
+        $this->log('tick start');
+        try {
+            @ftruncate($fp, 0);
+            @fwrite($fp, (string) getmypid());
+            $this->processQueue();
+            $this->refreshIndexes();
+            if ($this->shouldCompact()) {
+                $this->log('compaction is due (last run > 24 h ago)');
+                $this->compact();
+                $this->markCompacted();
+            } else {
+                $this->log('compaction skipped (last run within 24 h)');
+            }
+            $this->log(sprintf('tick complete in %.2fs', microtime(true) - $tStart));
+        } catch (\Throwable $e) {
+            $this->log('tick aborted: ' . $e->getMessage(), 'ERROR');
+            throw $e;
+        } finally {
+            flock($fp, LOCK_UN);
+            fclose($fp);
         }
     }
 
@@ -298,25 +390,35 @@ final class memhelper
     {
         $dir = $this->queueDir();
         if (!is_dir($dir)) {
+            $this->log('queue: dir not present yet (no enhance() calls?)');
             return;
         }
         $files = glob($dir . '/*.json') ?: [];
         if ($files === []) {
+            $this->log('queue: empty');
             return;
         }
         sort($files);
-        foreach ($files as $f) {
+        $total = count($files);
+        $this->log('queue: ' . $total . ' conversation(s) to process');
+        foreach ($files as $i => $f) {
+            $idx = $i + 1;
+            $pct = (int) round($idx * 100 / $total);
             try {
                 $raw = (string) file_get_contents($f);
                 $convo = json_decode($raw, true);
                 if (is_array($convo) && $convo !== []) {
+                    $this->log(sprintf('queue: [%d/%d] (%d%%) extracting from %d-turn conversation', $idx, $total, $pct, count($convo)));
                     $this->extractAndPersist($convo);
+                } else {
+                    $this->log(sprintf('queue: [%d/%d] skipped (empty or unparseable json)', $idx, $total));
                 }
-            } catch (\Throwable) {
-                // bad json or partial write — skip without aborting the batch
+            } catch (\Throwable $e) {
+                $this->log(sprintf('queue: [%d/%d] threw %s', $idx, $total, $e->getMessage()), 'WARN');
             }
             @unlink($f);
         }
+        $this->log('queue: drain complete');
     }
 
     // ====================================================================
@@ -497,13 +599,21 @@ final class memhelper
         } catch (\Throwable) {
             $db->query('DROP TABLE IF EXISTS memories');
             $db->query('DROP TABLE IF EXISTS memhelper_meta');
+            $db->query('DROP TABLE IF EXISTS memhelper_state');
         }
         $db->query(
             'CREATE VIRTUAL TABLE IF NOT EXISTS memories USING fts5(slug UNINDEXED, kind UNINDEXED, title, body, tokenize="unicode61 remove_diacritics 2")'
         );
         $db->query(
-            'CREATE TABLE IF NOT EXISTS memhelper_meta (setting_key TEXT PRIMARY KEY, setting_value TEXT)'
+            'CREATE TABLE IF NOT EXISTS memhelper_state (
+                slug TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                mtime INTEGER NOT NULL,
+                hash TEXT NOT NULL,
+                indexed_at INTEGER NOT NULL
+            )'
         );
+        $db->query('CREATE INDEX IF NOT EXISTS memhelper_state_kind ON memhelper_state(kind)');
     }
 
     private function initSchemaMysql(dbhelper $db): void
@@ -518,9 +628,13 @@ final class memhelper
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
         );
         $db->query(
-            'CREATE TABLE IF NOT EXISTS memhelper_meta (
-                setting_key VARCHAR(64) NOT NULL PRIMARY KEY,
-                setting_value TEXT
+            'CREATE TABLE IF NOT EXISTS memhelper_state (
+                slug VARCHAR(255) NOT NULL PRIMARY KEY,
+                kind VARCHAR(16) NOT NULL,
+                mtime BIGINT NOT NULL,
+                hash VARCHAR(64) NOT NULL,
+                indexed_at BIGINT NOT NULL,
+                KEY memhelper_state_kind (kind)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
         );
     }
@@ -541,31 +655,79 @@ final class memhelper
         );
         $db->query('CREATE INDEX IF NOT EXISTS memories_tsv_idx ON memories USING gin(tsv)');
         $db->query(
-            'CREATE TABLE IF NOT EXISTS memhelper_meta (
-                setting_key TEXT PRIMARY KEY,
-                setting_value TEXT
+            'CREATE TABLE IF NOT EXISTS memhelper_state (
+                slug TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                mtime BIGINT NOT NULL,
+                hash TEXT NOT NULL,
+                indexed_at BIGINT NOT NULL
             )'
         );
+        $db->query('CREATE INDEX IF NOT EXISTS memhelper_state_kind ON memhelper_state(kind)');
     }
 
-    private function indexUpsertAll(string $slug, string $kind, string $title, string $body): void
+    private function writeEntryOne(
+        dbhelper $db,
+        string $slug,
+        string $kind,
+        string $title,
+        string $body,
+        int $mtime
+    ): void {
+        $db->delete('memories', ['slug' => $slug]);
+        $db->insert('memories', [
+            'slug' => $slug,
+            'kind' => $kind,
+            'title' => $title,
+            'body' => $body
+        ]);
+        $db->delete('memhelper_state', ['slug' => $slug]);
+        $db->insert('memhelper_state', [
+            'slug' => $slug,
+            'kind' => $kind,
+            'mtime' => $mtime,
+            'hash' => sha1($body),
+            'indexed_at' => time()
+        ]);
+    }
+
+    private function removeEntryOne(dbhelper $db, string $slug): void
+    {
+        $db->delete('memories', ['slug' => $slug]);
+        $db->delete('memhelper_state', ['slug' => $slug]);
+    }
+
+    private function writeEntryAll(string $slug, string $kind, string $title, string $body, int $mtime): void
     {
         foreach ($this->dbs as $entry) {
-            $entry['db']->delete('memories', ['slug' => $slug]);
-            $entry['db']->insert('memories', [
-                'slug' => $slug,
-                'kind' => $kind,
-                'title' => $title,
-                'body' => $body
-            ]);
+            $this->writeEntryOne($entry['db'], $slug, $kind, $title, $body, $mtime);
         }
     }
 
-    private function indexDeleteAll(string $slug): void
+    private function removeEntryAll(string $slug): void
     {
         foreach ($this->dbs as $entry) {
-            $entry['db']->delete('memories', ['slug' => $slug]);
+            $this->removeEntryOne($entry['db'], $slug);
         }
+    }
+
+    /**
+     * Drop rows that exist in `memories` but have no matching state — happens
+     * after schema upgrades or out-of-band DB tampering. Keeps the per-DB
+     * state authoritative without paying the cost of a full rebuild.
+     */
+    private function purgeOrphans(dbhelper $db): int
+    {
+        $known = $db->fetch_col('SELECT slug FROM memhelper_state') ?: [];
+        $present = $db->fetch_col('SELECT slug FROM memories') ?: [];
+        $orphans = array_diff(
+            array_map('strval', $present),
+            array_map('strval', $known)
+        );
+        foreach ($orphans as $slug) {
+            $db->delete('memories', ['slug' => $slug]);
+        }
+        return count($orphans);
     }
 
     // ====================================================================
@@ -574,47 +736,28 @@ final class memhelper
 
     private function refreshIndexes(): void
     {
-        // markdown memories: rebuild per-db when the on-disk mtime is newer
-        // than the indexed_until cached in that db's meta table.
+        $this->log('index refresh: ' . count($this->dbs) . ' db(s), ' . count($this->filesDirs) . ' files dir(s)');
         foreach ($this->dbs as $entry) {
-            $this->refreshMarkdownInto($entry['db']);
+            $this->refreshMarkdownInto($entry['driver'], $entry['db']);
         }
-        // files: dirs — walk, extract text, mirror to all DBs.
-        $this->refreshFilesAcrossAll();
-    }
-
-    private function refreshMarkdownInto(dbhelper $db): void
-    {
-        // unconditional rebuild on every call. filesystem mtime resolution is
-        // 1 s on most fs, so two writes inside the same second would otherwise
-        // bypass an mtime-cached short-circuit and lose the second file. the
-        // memory dir is small enough that a full rebuild is single-digit ms.
-        $db->delete('memories', ['kind' => 'memory']);
-        foreach (glob($this->output . '/*.md') ?: [] as $file) {
-            $slug = basename($file, '.md');
-            // skip files whose name is not a valid slug — the rest of the
-            // pipeline assumes assertValidSlug() succeeds when retrieving a
-            // hit, so putting non-conforming names into the index would
-            // crash composeBlock() later.
-            if (!self::isValidSlug($slug)) {
-                continue;
+        if ($this->filesDirs !== []) {
+            $desired = $this->scanFilesDirs();
+            $textCache = [];
+            foreach ($this->dbs as $entry) {
+                $this->refreshFilesInto($entry['driver'], $entry['db'], $desired, $textCache);
             }
-            $raw = (string) file_get_contents($file);
-            [$fm, $body] = self::splitFrontmatter($raw);
-            $db->insert('memories', [
-                'slug' => $slug,
-                'kind' => 'memory',
-                'title' => (string) ($fm['description'] ?? ''),
-                'body' => $body
-            ]);
         }
     }
 
-    private function refreshFilesAcrossAll(): void
+    /**
+     * @return array<string, array{path: string, mtime: int}> keyed by attached-slug
+     */
+    private function scanFilesDirs(): array
     {
-        $current = [];
+        $desired = [];
         foreach ($this->filesDirs as $dir) {
             if (!is_dir($dir)) {
+                $this->log('files: dir missing — ' . $dir, 'WARN');
                 continue;
             }
             $iter = new RecursiveIteratorIterator(
@@ -624,40 +767,216 @@ final class memhelper
                 if (!$f->isFile()) {
                     continue;
                 }
-                $current[$f->getPathname()] = $f->getMTime();
+                $path = (string) $f->getPathname();
+                $desired[self::pathToSlug($path)] = ['path' => $path, 'mtime' => (int) $f->getMTime()];
             }
         }
-        // remove rows whose underlying file disappeared from any watch dir
-        $known = [];
-        foreach ($this->dbs as $entry) {
-            $slugs = $entry['db']->fetch_col(
-                "SELECT slug FROM memories WHERE kind = ?",
-                'attached'
-            ) ?: [];
-            foreach ($slugs as $s) {
-                $known[(string) $s] = true;
-            }
+        return $desired;
+    }
+
+    private function refreshMarkdownInto(string $driver, dbhelper $db): void
+    {
+        $tStart = microtime(true);
+        $orphans = $this->purgeOrphans($db);
+        if ($orphans > 0) {
+            $this->log("markdown [$driver]: dropped {$orphans} orphan(s) from memories");
         }
-        foreach (array_keys($known) as $slug) {
-            $path = self::slugToPath($slug);
-            if ($path === null || !isset($current[$path])) {
-                $this->indexDeleteAll($slug);
-            }
-        }
-        // (re)index each present file — extractText returns null on
-        // unsupported types so they're silently skipped.
-        foreach ($current as $path => $mtime) {
-            $text = $this->extractText((string) $path);
-            if ($text === null) {
+
+        // desired = what disk says should be indexed
+        $desired = [];
+        foreach (glob($this->output . '/*.md') ?: [] as $file) {
+            $slug = basename($file, '.md');
+            if (!self::isValidSlug($slug)) {
                 continue;
             }
-            $this->indexUpsertAll(
-                self::pathToSlug((string) $path),
-                'attached',
-                basename((string) $path),
-                $text
-            );
+            $desired[$slug] = ['path' => $file, 'mtime' => (int) filemtime($file)];
         }
+
+        // current = what state table says is indexed
+        $rows = $db->fetch_all("SELECT slug, mtime, hash FROM memhelper_state WHERE kind = ?", 'memory') ?: [];
+        $current = [];
+        foreach ($rows as $r) {
+            $current[(string) $r['slug']] = ['mtime' => (int) $r['mtime'], 'hash' => (string) $r['hash']];
+        }
+
+        // plan
+        $toAdd = [];
+        $toUpdate = [];
+        $toRemove = [];
+        $unchanged = 0;
+        foreach ($desired as $slug => $info) {
+            if (!isset($current[$slug])) {
+                $toAdd[] = $slug;
+            } elseif ($current[$slug]['mtime'] !== $info['mtime']) {
+                $toUpdate[] = $slug;
+            } else {
+                $unchanged++;
+            }
+        }
+        foreach (array_keys($current) as $slug) {
+            if (!isset($desired[$slug])) {
+                $toRemove[] = $slug;
+            }
+        }
+
+        $total = count($toAdd) + count($toUpdate) + count($toRemove);
+        if ($total === 0) {
+            $this->log(sprintf('markdown [%s]: nothing changed — unchanged=%d (%.2fs)', $driver, $unchanged, microtime(true) - $tStart));
+            return;
+        }
+        $this->log(sprintf(
+            'markdown [%s]: plan — add=%d update=%d remove=%d unchanged=%d',
+            $driver, count($toAdd), count($toUpdate), count($toRemove), $unchanged
+        ));
+
+        // apply each change as its own write — a crash mid-loop leaves
+        // already-processed slugs persisted, so the next tick picks them up
+        // as unchanged and only processes the remaining diff.
+        $done = 0;
+        $tag = "markdown [$driver]";
+
+        foreach ($toRemove as $slug) {
+            $this->removeEntryOne($db, $slug);
+            $done++;
+            $this->progress($tag, $done, $total, "removed $slug");
+        }
+        foreach ($toAdd as $slug) {
+            $info = $desired[$slug];
+            $raw = (string) file_get_contents($info['path']);
+            [$fm, $body] = self::splitFrontmatter($raw);
+            $this->writeEntryOne($db, $slug, 'memory', (string) ($fm['description'] ?? ''), $body, $info['mtime']);
+            $done++;
+            $this->progress($tag, $done, $total, "added $slug");
+        }
+        foreach ($toUpdate as $slug) {
+            $info = $desired[$slug];
+            $raw = (string) file_get_contents($info['path']);
+            [$fm, $body] = self::splitFrontmatter($raw);
+            $hash = sha1($body);
+            if ($hash === $current[$slug]['hash']) {
+                // mtime changed but content didn't — refresh the state row's
+                // mtime without rewriting the FTS body (expensive on FTS5).
+                $db->update(
+                    'memhelper_state',
+                    ['mtime' => $info['mtime'], 'indexed_at' => time()],
+                    ['slug' => $slug]
+                );
+                $done++;
+                $this->progress($tag, $done, $total, "touched $slug (mtime-only)");
+                continue;
+            }
+            $this->writeEntryOne($db, $slug, 'memory', (string) ($fm['description'] ?? ''), $body, $info['mtime']);
+            $done++;
+            $this->progress($tag, $done, $total, "updated $slug");
+        }
+        $this->log(sprintf('markdown [%s]: complete in %.2fs', $driver, microtime(true) - $tStart));
+    }
+
+    /**
+     * @param array<string, array{path: string, mtime: int}> $desired
+     * @param array<string, ?string>                          $textCache  reused across DBs
+     */
+    private function refreshFilesInto(string $driver, dbhelper $db, array $desired, array &$textCache): void
+    {
+        $tStart = microtime(true);
+        $orphans = $this->purgeOrphans($db);
+        if ($orphans > 0) {
+            $this->log("files [$driver]: dropped {$orphans} orphan(s)");
+        }
+
+        $rows = $db->fetch_all("SELECT slug, mtime, hash FROM memhelper_state WHERE kind = ?", 'attached') ?: [];
+        $current = [];
+        foreach ($rows as $r) {
+            $current[(string) $r['slug']] = ['mtime' => (int) $r['mtime'], 'hash' => (string) $r['hash']];
+        }
+
+        $toAdd = [];
+        $toUpdate = [];
+        $toRemove = [];
+        $unchanged = 0;
+        foreach ($desired as $slug => $info) {
+            if (!isset($current[$slug])) {
+                $toAdd[] = $slug;
+            } elseif ($current[$slug]['mtime'] !== $info['mtime']) {
+                $toUpdate[] = $slug;
+            } else {
+                $unchanged++;
+            }
+        }
+        foreach (array_keys($current) as $slug) {
+            if (!isset($desired[$slug])) {
+                $toRemove[] = $slug;
+            }
+        }
+
+        $total = count($toAdd) + count($toUpdate) + count($toRemove);
+        if ($total === 0) {
+            $this->log(sprintf('files [%s]: nothing changed — unchanged=%d (%.2fs)', $driver, $unchanged, microtime(true) - $tStart));
+            return;
+        }
+        $this->log(sprintf(
+            'files [%s]: plan — add=%d update=%d remove=%d unchanged=%d',
+            $driver, count($toAdd), count($toUpdate), count($toRemove), $unchanged
+        ));
+
+        $done = 0;
+        $tag = "files [$driver]";
+
+        foreach ($toRemove as $slug) {
+            $this->removeEntryOne($db, $slug);
+            $done++;
+            $this->progress($tag, $done, $total, "removed " . basename((string) self::slugToPath($slug)));
+        }
+
+        // extract text via the shared cache so multi-DB setups don't re-run
+        // pdftotext on the same file once per backend.
+        $getText = function (string $path) use (&$textCache): ?string {
+            if (!array_key_exists($path, $textCache)) {
+                $textCache[$path] = $this->extractText($path);
+            }
+            return $textCache[$path];
+        };
+
+        foreach ($toAdd as $slug) {
+            $info = $desired[$slug];
+            $text = $getText($info['path']);
+            if ($text === null) {
+                // unsupported type: remove any stale row + skip without
+                // counting toward indexed totals.
+                $this->removeEntryOne($db, $slug);
+                $done++;
+                $this->progress($tag, $done, $total, "skipped " . basename($info['path']) . " (unsupported)");
+                continue;
+            }
+            $this->writeEntryOne($db, $slug, 'attached', basename($info['path']), $text, $info['mtime']);
+            $done++;
+            $this->progress($tag, $done, $total, "added " . basename($info['path']));
+        }
+
+        foreach ($toUpdate as $slug) {
+            $info = $desired[$slug];
+            $text = $getText($info['path']);
+            if ($text === null) {
+                $this->removeEntryOne($db, $slug);
+                $done++;
+                $this->progress($tag, $done, $total, "dropped " . basename($info['path']) . " (no longer extractable)");
+                continue;
+            }
+            if (sha1($text) === $current[$slug]['hash']) {
+                $db->update(
+                    'memhelper_state',
+                    ['mtime' => $info['mtime'], 'indexed_at' => time()],
+                    ['slug' => $slug]
+                );
+                $done++;
+                $this->progress($tag, $done, $total, "touched " . basename($info['path']) . " (mtime-only)");
+                continue;
+            }
+            $this->writeEntryOne($db, $slug, 'attached', basename($info['path']), $text, $info['mtime']);
+            $done++;
+            $this->progress($tag, $done, $total, "updated " . basename($info['path']));
+        }
+        $this->log(sprintf('files [%s]: complete in %.2fs', $driver, microtime(true) - $tStart));
     }
 
     // ====================================================================
@@ -667,6 +986,7 @@ final class memhelper
     private function extractAndPersist(array $conversation): void
     {
         if (!$this->aiAvailable()) {
+            $this->log('extract: ai not configured — skipping (set ai.provider + ai.model in config.yaml)', 'WARN');
             return;
         }
         $existing = $this->listMemories();
@@ -693,17 +1013,29 @@ final class memhelper
             "  description: one-line summary (required for add)\n" .
             "  type: \"user\" | \"feedback\" | \"project\" | \"reference\" (required for add)\n\n" .
             "Only include changes worth keeping. Return [] if nothing is worth saving. Respond with raw JSON, no markdown fences.";
+        $this->log(sprintf('extract: calling ai (%s/%s) with prompt of %d bytes', $this->aiConfig['provider'] ?? '?', $this->aiConfig['model'] ?? '?', strlen($prompt)));
+        $tStart = microtime(true);
         try {
             $raw = $this->callAi($prompt);
-        } catch (\Throwable) {
+        } catch (\Throwable $e) {
+            $this->log('extract: ai call failed — ' . $e->getMessage(), 'ERROR');
             return;
         }
-        $this->applyDiff(self::decodeDiff($raw));
+        $diff = self::decodeDiff($raw);
+        $this->log(sprintf('extract: ai responded in %.2fs (%d bytes), decoded %d action(s)', microtime(true) - $tStart, strlen($raw), count($diff)));
+        $counts = ['add' => 0, 'update' => 0, 'delete' => 0, 'skip' => 0];
+        foreach ($diff as $d) {
+            $a = (string) ($d['action'] ?? 'skip');
+            $counts[$a] = ($counts[$a] ?? 0) + 1;
+        }
+        $this->log(sprintf('extract: applying diff — add=%d update=%d delete=%d skip=%d', $counts['add'], $counts['update'], $counts['delete'], $counts['skip']));
+        $this->applyDiff($diff);
     }
 
     private function compact(): void
     {
         if (!$this->aiAvailable()) {
+            $this->log('compact: ai not configured — skipping', 'WARN');
             return;
         }
         $blocks = [];
@@ -717,19 +1049,25 @@ final class memhelper
                 "\n\n" . trim($body);
         }
         if ($blocks === []) {
+            $this->log('compact: no memory files to evaluate');
             return;
         }
+        $this->log(sprintf('compact: evaluating %d memory entries', count($blocks)));
         $prompt =
             "You curate a long-term memory store for an LLM assistant. The current entries are listed below. Identify duplicates, contradictions, and obsolete facts. Merge overlapping entries into a single canonical entry. Drop anything that is no longer relevant.\n\n" .
             implode("\n\n---\n\n", $blocks) .
             "\n\nReturn a JSON array of actions using the same schema as the extract step (action, slug, content, description, type). Respond with raw JSON only, no markdown fences.";
+        $tStart = microtime(true);
         try {
             $raw = $this->callAi($prompt);
-        } catch (\Throwable) {
+        } catch (\Throwable $e) {
+            $this->log('compact: ai call failed — ' . $e->getMessage(), 'ERROR');
             return;
         }
+        $diff = self::decodeDiff($raw);
+        $this->log(sprintf('compact: ai responded in %.2fs, decoded %d action(s) — backing up before apply', microtime(true) - $tStart, count($diff)));
         $this->backup();
-        $this->applyDiff(self::decodeDiff($raw));
+        $this->applyDiff($diff);
     }
 
     private function shouldCompact(): bool
@@ -781,9 +1119,9 @@ final class memhelper
                     'delete' => $this->deleteMemory($slug),
                     default => null
                 };
-            } catch (RuntimeException) {
-                // bad slug or write failure on a single entry shouldn't abort
-                // the whole diff; partial progress sticks.
+                $this->log(sprintf('diff: %s %s', $a, $slug));
+            } catch (RuntimeException $e) {
+                $this->log(sprintf('diff: %s %s failed — %s', $a, $slug, $e->getMessage()), 'WARN');
                 continue;
             }
         }
@@ -807,7 +1145,15 @@ final class memhelper
         if (file_put_contents($path, $serialized) === false) {
             throw new RuntimeException('memhelper: failed to write memory file: ' . $path);
         }
-        $this->indexUpsertAll($slug, 'memory', (string) ($frontmatter['description'] ?? ''), trim($content));
+        // mirror to all DBs immediately so the next enhance() call sees the
+        // new entry without waiting for the next worker tick.
+        $this->writeEntryAll(
+            $slug,
+            'memory',
+            (string) ($frontmatter['description'] ?? ''),
+            trim($content),
+            (int) filemtime($path)
+        );
     }
 
     private function deleteMemory(string $slug): bool
@@ -820,7 +1166,7 @@ final class memhelper
         if (!@unlink($path)) {
             throw new RuntimeException('memhelper: failed to delete memory file: ' . $path);
         }
-        $this->indexDeleteAll($slug);
+        $this->removeEntryAll($slug);
         return true;
     }
 
