@@ -55,33 +55,39 @@ final class Test extends TestCase
         @rmdir($path);
     }
 
-    public function testEmptyMemoryDirReturnsEmptyString(): void
+    public function testEmptyMemoryDirReturnsEmptyArray(): void
     {
         $this->mem()->work();
-        $this->assertSame('', $this->mem()->enhance([
-            ['role' => 'user', 'content' => 'hello']
-        ]));
+        $this->assertSame([], $this->mem()->findFacts('hello'));
     }
 
-    public function testRelevantMemoryIsRetrievedForMatchingTopic(): void
+    public function testFindFactsReturnsMatchingEntry(): void
     {
         file_put_contents(
             $this->tmpDir . '/editor-preferences.md',
             "---\nname: editor-preferences\ndescription: editor of choice\nmetadata:\n  type: user\n---\n\nEditor is Helix.\n"
         );
         $this->mem()->work();
-        $block = $this->mem()->enhance([
-            ['role' => 'user', 'content' => 'what is my editor?']
-        ]);
-        $this->assertStringContainsString('=== Memory ===', $block);
-        $this->assertStringContainsString('editor-preferences', $block);
-        $this->assertStringContainsString('Helix', $block);
+        $facts = $this->mem()->findFacts('what is my editor?');
+        $this->assertGreaterThan(0, count($facts));
+        $this->assertSame('editor-preferences', $facts[0]['slug']);
+        $this->assertSame('user', $facts[0]['type']);
+        $this->assertSame('editor of choice', $facts[0]['description']);
+        $this->assertSame('Editor is Helix.', $facts[0]['body']);
+        $this->assertNull($facts[0]['via']);
+    }
+
+    public function testEmptyQueryReturnsEmpty(): void
+    {
+        $this->seedEditorMemory();
+        $this->mem()->work();
+        $this->assertSame([], $this->mem()->findFacts(''));
+        $this->assertSame([], $this->mem()->findFacts('   '));
     }
 
     public function testInputFilesAreStagedAsSourcesForDistillation(): void
     {
-        // under model B, input_files do not appear in enhance() directly —
-        // they are first read into memhelper_state with kind='source' and the
+        // input_files are read into memhelper_state with kind='source' and the
         // worker's distillation pass asks the ai to summarise them into md
         // entries. without an ai configured we can still verify that the
         // sources phase picks them up and stores the body verbatim, ready
@@ -91,9 +97,6 @@ final class Test extends TestCase
         file_put_contents($filesDir . '/notes.txt', 'Charly is a multi-agent orchestrator built in php.');
         $this->writeConfig($filesDir);
         $this->mem()->work();
-        // poke the internal sqlite directly — the source row should exist
-        // with the file's text content stored as the body.
-        // internal db now always lives at <output>/.data/memhelper.db
         $pdo = new \PDO('sqlite:' . $this->tmpDir . '/.data/memhelper.db');
         $row = $pdo->query(
             "SELECT slug, kind, body FROM memhelper_state WHERE kind = 'source' AND slug LIKE '%notes.txt'"
@@ -103,74 +106,10 @@ final class Test extends TestCase
         $this->assertSame('Charly is a multi-agent orchestrator built in php.', $row['body']);
     }
 
-    public function testConversationIsEnqueuedForWorker(): void
-    {
-        $this->mem()->enhance([
-            ['role' => 'user', 'content' => 'i prefer helix as my editor'],
-            ['role' => 'assistant', 'content' => 'noted']
-        ]);
-        $queued = glob($this->tmpDir . '/.data/queue/*.json') ?: [];
-        $this->assertCount(1, $queued);
-        $decoded = json_decode((string) file_get_contents($queued[0]), true);
-        $this->assertIsArray($decoded);
-        $this->assertSame('i prefer helix as my editor', $decoded[0]['content']);
-    }
-
-    public function testEmptyConversationArrayDoesNotEnqueue(): void
-    {
-        // explicit empty array is still legal at the signature level (the
-        // caller might pass an empty turn list); enqueueing is the costly
-        // side effect, so it must stay gated on non-empty input.
-        $this->mem()->enhance([]);
-        $this->assertSame([], glob($this->tmpDir . '/.data/queue/*.json') ?: []);
-    }
-
-    public function testStringConversationIsAccepted(): void
-    {
-        $this->seedEditorMemory();
-        $this->mem()->work();
-        $block = $this->mem()->enhance('what is my editor?');
-        $this->assertStringContainsString('Helix', $block);
-    }
-
-    public function testGeminiPartsShapeIsAccepted(): void
-    {
-        $this->seedEditorMemory();
-        $this->mem()->work();
-        $block = $this->mem()->enhance([
-            ['role' => 'user', 'parts' => [['text' => 'what is my editor?']]]
-        ]);
-        $this->assertStringContainsString('Helix', $block);
-    }
-
-    public function testAnthropicContentBlocksAreAccepted(): void
-    {
-        $this->seedEditorMemory();
-        $this->mem()->work();
-        $block = $this->mem()->enhance([
-            ['role' => 'user', 'content' => [
-                ['type' => 'text', 'text' => 'what is my editor?']
-            ]]
-        ]);
-        $this->assertStringContainsString('Helix', $block);
-    }
-
-    public function testListOfStringsIsAccepted(): void
-    {
-        $this->seedEditorMemory();
-        $this->mem()->work();
-        $block = $this->mem()->enhance([
-            'hi there',
-            'hello back',
-            'what is my editor?'
-        ]);
-        $this->assertStringContainsString('Helix', $block);
-    }
-
     public function testCrossReferenceExpansionPullsLinkedNeighbour(): void
     {
         // a query that lexically matches only one entry should still surface
-        // its [[…]]-linked neighbour because composeBlock does a 1-hop expand.
+        // its [[…]]-linked neighbour because findFacts does a 1-hop expand.
         file_put_contents(
             $this->tmpDir . '/contact-julia.md',
             "---\nname: contact-julia\ndescription: contact julia fuchs\nmetadata:\n  type: user\n---\n\nJulia Fuchs ist die Schwester von [[user-name-david]].\n"
@@ -181,13 +120,14 @@ final class Test extends TestCase
         );
         $this->mem()->work();
 
-        // query references julia only — david must still appear via the link.
-        $block = $this->mem()->enhance([
-            ['role' => 'user', 'content' => 'kennst du Julia Fuchs?']
-        ]);
-        $this->assertStringContainsString('contact-julia', $block);
-        $this->assertStringContainsString('David Vielhuber', $block);
-        $this->assertStringContainsString('via [[…]] link', $block);
+        $facts = $this->mem()->findFacts('kennst du Julia Fuchs?');
+        $slugs = array_column($facts, 'slug');
+        $this->assertContains('contact-julia', $slugs);
+        $this->assertContains('user-name-david', $slugs);
+        $julia = $facts[array_search('contact-julia', $slugs, true)];
+        $david = $facts[array_search('user-name-david', $slugs, true)];
+        $this->assertNull($julia['via']);
+        $this->assertSame('link', $david['via']);
     }
 
     public function testLinkTableIsRebuiltOnFirstTickAfterUpgrade(): void

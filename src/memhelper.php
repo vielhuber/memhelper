@@ -10,12 +10,14 @@ use RuntimeException;
 use Symfony\Component\Yaml\Yaml;
 use vielhuber\aihelper\aihelper;
 use vielhuber\dbhelper\dbhelper;
+use vielhuber\simplemcp\Attributes\McpTool;
+use vielhuber\simplemcp\Attributes\Schema;
 
 /**
  * memhelper — markdown-first memory layer for LLM agents.
  *
  *   $mem = new memhelper('/path/to/config.yaml');        // yaml path is required
- *   $prompt = $mem->enhance($conversation) . $prompt;    // host API
+ *   $facts = $mem->findFacts('how is X named?');         // host API
  *   $mem->work();                                        // worker tick
  *
  * Plain `.md` files under `output` stay the source of truth. The configured
@@ -42,15 +44,24 @@ final class memhelper
     private ?string $logPath = null;
 
     /**
-     * The host must point the constructor at the absolute path of its
-     * memhelper yaml — there is no implicit discovery. The optional second
-     * argument enables verbose logging to that file (append mode); messages
-     * are additionally written to stderr when running under the CLI SAPI so
-     * supervisord-managed processes surface them too.
+     * The host may pass the absolute path of its memhelper yaml explicitly,
+     * or leave both args empty to fall back to the environment variables
+     * `MEMHELPER_CONFIG` and `MEMHELPER_LOG`. The env-fallback path is what
+     * makes `new memhelper()` callable from simplemcp's reflection-driven
+     * tool discovery: no host code in the MCP server, env vars come in
+     * through the mcp.json `env` block.
      */
-    public function __construct(string $configPath, ?string $logPath = null)
+    public function __construct(string $configPath = '', ?string $logPath = null)
     {
-        $this->logPath = $logPath !== null && $logPath !== '' ? $logPath : null;
+        if ($configPath === '') {
+            $envCfg = getenv('MEMHELPER_CONFIG');
+            $configPath = $envCfg === false ? '' : $envCfg;
+        }
+        if ($logPath === null || $logPath === '') {
+            $envLog = getenv('MEMHELPER_LOG');
+            $logPath = $envLog === false ? null : ($envLog === '' ? null : $envLog);
+        }
+        $this->logPath = $logPath;
         $cfg = self::config($configPath);
 
         $output = (string) ($cfg['output'] ?? '');
@@ -155,138 +166,94 @@ final class memhelper
     // ====================================================================
 
     /**
-     * Append-ready memory block for the host's prompt. Returns the memory
-     * entries most relevant to what is being discussed in the conversation.
-     * The conversation is also written to the worker's queue so any new
-     * facts get extracted in the background; no writes happen on the call's
-     * critical path.
+     * Look up curated facts for a natural-language query. Tokenises the
+     * query, runs the fts5 search, expands hits by one hop along the
+     * `[[…]]` link graph and returns the matching memory entries as raw
+     * structured data (slug, type, description, body, score, via).
      *
-     *   $mem = new memhelper('/path/to/config.yaml');
-     *   $prompt = $mem->enhance($conversation) . $prompt;
+     * This is both the host-facing PHP method AND the MCP-exposed tool
+     * (simplemcp's discovery picks the `#[McpTool]` attribute up directly,
+     * so there is no separate wrapper class to keep in sync).
      *
-     * `$conversation` may be any of:
-     *   - a plain string (treated as a single user message)
-     *   - a list of strings (alternating user / assistant turns)
-     *   - OpenAI / Anthropic shape: `[['role' => 'user'|'assistant'|'system', 'content' => string|array], ...]`
-     *     (content may be a string OR an array of content blocks with `text`)
-     *   - Google Gemini shape: `[['role' => 'user'|'model', 'parts' => [['text' => '...']]], ...]`
-     *   - any custom shape where each entry carries a `content`, `text` or `message` key
-     *
-     * Unknown shapes degrade gracefully — anything that yields no extractable
-     * text is just dropped, never throws.
+     * @return list<array{slug:string,type:string,description:string,body:string,score:float|null,via:string|null}>
      */
-    public function enhance(mixed $conversation): string
-    {
-        $normalized = self::normalizeConversation($conversation);
-        $query = self::queryFromConversation($normalized);
-        $hits = $query !== '' ? $this->search($query, 8) : [];
-        $block = $this->composeBlock($hits);
-        if ($normalized !== []) {
-            $this->enqueueConversation($normalized);
-        }
-        $this->log(sprintf(
-            'enhance: turns=%d query=%dB hits=%d block=%dB',
-            count($normalized),
-            strlen($query),
-            count($hits),
-            strlen($block)
-        ));
-        return $block;
-    }
-
-    /**
-     * Reduce any supported conversation shape to a flat list of
-     * `['role' => string, 'content' => string]` entries so the search query
-     * extraction and the worker's extraction prompt can stay simple.
-     */
-    private static function normalizeConversation(mixed $input): array
-    {
-        if (is_string($input)) {
-            return $input === '' ? [] : [['role' => 'user', 'content' => $input]];
-        }
-        if (!is_array($input)) {
+    #[McpTool(
+        name: 'find_facts',
+        description: 'Look up curated facts the assistant has stored about the user, their projects, contacts, contracts, preferences and recurring rules. Returns an array of `{slug, type, description, body, score, via}` entries. Cross-references between facts (`[[slug]]`) are followed one hop and surface as `via:"link"` neighbours. Use this whenever an answer depends on prior personal knowledge — names, family, household details, accounts, dates, preferences, established routines.'
+    )]
+    public function findFacts(
+        #[Schema(
+            description: 'Natural-language query, e.g. "Wie heißt der Hund von David?" or "monthly hosting cost". Matches the curated entries via full-text search over their bodies.'
+        )]
+        string $query,
+        #[Schema(
+            description: 'Maximum number of primary matches to return (1-20). Linked neighbours are returned in addition and capped at the same number.',
+            minimum: 1,
+            maximum: 20,
+            default: 10
+        )]
+        int $limit = 10
+    ): array {
+        $query = trim($query);
+        $limit = max(1, min(20, $limit));
+        if ($query === '') {
+            $this->log('find_facts: empty query — returning []');
             return [];
         }
-        $out = [];
-        foreach (array_values($input) as $i => $msg) {
-            if (is_string($msg)) {
-                // bare-string list — assume the host gave us turns in order
-                // starting with the user.
-                $out[] = [
-                    'role' => $i % 2 === 0 ? 'user' : 'assistant',
-                    'content' => $msg
-                ];
-                continue;
+        $hits = $this->search($query, $limit);
+        $primarySlugs = [];
+        foreach ($hits as $h) {
+            $slug = (string) ($h['slug'] ?? '');
+            if ($slug !== '') {
+                $primarySlugs[] = $slug;
             }
-            if (!is_array($msg)) {
-                continue;
-            }
-            $role = self::normalizeRole((string) ($msg['role'] ?? 'user'));
-            $content = self::extractMessageText($msg);
-            if ($content === '') {
-                continue;
-            }
-            $out[] = ['role' => $role, 'content' => $content];
         }
-        return $out;
-    }
+        $neighbours = $this->neighboursOf($primarySlugs, max(1, $limit));
 
-    private static function normalizeRole(string $role): string
-    {
-        // gemini uses 'model' where openai/anthropic use 'assistant'.
-        return $role === 'model' ? 'assistant' : $role;
-    }
-
-    private static function extractMessageText(array $msg): string
-    {
-        // openai / anthropic: content can be a string OR an array of content
-        // blocks (each potentially `{type, text}` or `{text}`).
-        if (isset($msg['content'])) {
-            $c = $msg['content'];
-            if (is_string($c)) {
-                return $c;
+        $results = [];
+        $seen = [];
+        foreach ($hits as $h) {
+            $slug = (string) ($h['slug'] ?? '');
+            if ($slug === '' || isset($seen[$slug])) {
+                continue;
             }
-            if (is_array($c)) {
-                $parts = [];
-                foreach ($c as $block) {
-                    if (is_string($block)) {
-                        $parts[] = $block;
-                        continue;
-                    }
-                    if (is_array($block)) {
-                        if (isset($block['text']) && is_string($block['text'])) {
-                            $parts[] = $block['text'];
-                        } elseif (isset($block['content']) && is_string($block['content'])) {
-                            $parts[] = $block['content'];
-                        }
-                    }
-                }
-                if ($parts !== []) {
-                    return implode("\n", $parts);
-                }
+            $entry = $this->getMemory($slug);
+            if ($entry === null) {
+                continue;
             }
+            $seen[$slug] = true;
+            $results[] = [
+                'slug' => $slug,
+                'type' => (string) ($entry['frontmatter']['metadata']['type'] ?? 'reference'),
+                'description' => (string) ($entry['frontmatter']['description'] ?? ''),
+                'body' => trim((string) $entry['body']),
+                'score' => isset($h['score']) ? (float) $h['score'] : null,
+                'via' => null
+            ];
         }
-        // gemini: { role, parts: [ { text }, ... ] }
-        if (isset($msg['parts']) && is_array($msg['parts'])) {
-            $parts = [];
-            foreach ($msg['parts'] as $p) {
-                if (is_string($p)) {
-                    $parts[] = $p;
-                } elseif (is_array($p) && isset($p['text']) && is_string($p['text'])) {
-                    $parts[] = $p['text'];
-                }
+        foreach ($neighbours as $slug) {
+            if (isset($seen[$slug])) {
+                continue;
             }
-            if ($parts !== []) {
-                return implode("\n", $parts);
+            $entry = $this->getMemory($slug);
+            if ($entry === null) {
+                continue;
             }
+            $seen[$slug] = true;
+            $results[] = [
+                'slug' => $slug,
+                'type' => (string) ($entry['frontmatter']['metadata']['type'] ?? 'reference'),
+                'description' => (string) ($entry['frontmatter']['description'] ?? ''),
+                'body' => trim((string) $entry['body']),
+                'score' => null,
+                'via' => 'link'
+            ];
         }
-        // legacy / custom fallback keys
-        foreach (['text', 'message', 'body'] as $key) {
-            if (isset($msg[$key]) && is_string($msg[$key])) {
-                return $msg[$key];
-            }
-        }
-        return '';
+        $this->log(sprintf(
+            'find_facts: query=%dB hits=%d neighbours=%d returned=%d',
+            strlen($query), count($hits), count($neighbours), count($results)
+        ));
+        return $results;
     }
 
     // ====================================================================
@@ -295,10 +262,10 @@ final class memhelper
 
     /**
      * @internal Infrastructure entry point used by bin/memhelper-worker only.
-     * One iteration of background maintenance: drain the conversation queue,
-     * refresh the search index across every configured database, and run
-     * the once-per-day compaction pass when due. Not part of the host API —
-     * application code should call enhance() instead.
+     * One iteration of background maintenance: refresh sources, distil them
+     * via ai, sync the curated mds into the fts5 index, and run the
+     * once-per-day compaction pass when due. Read access for hosts goes
+     * through findFacts().
      */
     public function work(): void
     {
@@ -312,15 +279,13 @@ final class memhelper
         $tStart = microtime(true);
         $this->log('tick start');
         try {
-            // phase 1: conversations → ai extracts facts → md files
-            $this->processQueue();
-            // phase 2: input_files + input_dbs → state.body, no fts5
+            // phase 1: input_files + input_dbs → state.body, no fts5
             $this->refreshSources();
-            // phase 3: ai distils undistilled / changed sources → md files
+            // phase 2: ai distils undistilled / changed sources → md files
             $this->distillSources();
-            // phase 4: sync the curated md files into the fts5 search index
+            // phase 3: sync the curated md files into the fts5 search index
             $this->refreshMemoryIndex();
-            // phase 5: periodic compaction
+            // phase 4: periodic compaction
             if ($this->shouldCompact()) {
                 $this->log('compaction is due (last run > 24 h ago)');
                 $this->compact();
@@ -413,116 +378,14 @@ final class memhelper
         return $this->output . '/.data';
     }
 
-    private function queueDir(): string
-    {
-        return $this->dataDir() . '/queue';
-    }
-
-    private function enqueueConversation(array $conversation): void
-    {
-        if ($conversation === []) {
-            return;
-        }
-        $dir = $this->queueDir();
-        if (!is_dir($dir) && !@mkdir($dir, 0775, true) && !is_dir($dir)) {
-            return;
-        }
-        // microtime prefix + random suffix gives a chronological, collision-
-        // free filename even under bursty parallel writes from the host app.
-        $name = sprintf(
-            '%s-%s.json',
-            str_replace('.', '-', sprintf('%.6f', microtime(true))),
-            bin2hex(random_bytes(4))
-        );
-        @file_put_contents($dir . '/' . $name, json_encode($conversation));
-    }
-
-    private function processQueue(): void
-    {
-        $dir = $this->queueDir();
-        if (!is_dir($dir)) {
-            $this->log('queue: dir not present yet (no enhance() calls?)');
-            return;
-        }
-        $files = glob($dir . '/*.json') ?: [];
-        if ($files === []) {
-            $this->log('queue: empty');
-            return;
-        }
-        sort($files);
-        $total = count($files);
-        $this->log('queue: ' . $total . ' conversation(s) to process');
-        foreach ($files as $i => $f) {
-            $idx = $i + 1;
-            $pct = (int) round($idx * 100 / $total);
-            try {
-                $raw = (string) file_get_contents($f);
-                $convo = json_decode($raw, true);
-                if (is_array($convo) && $convo !== []) {
-                    $this->log(sprintf('queue: [%d/%d] (%d%%) extracting from %d-turn conversation', $idx, $total, $pct, count($convo)));
-                    $this->extractAndPersist($convo);
-                } else {
-                    $this->log(sprintf('queue: [%d/%d] skipped (empty or unparseable json)', $idx, $total));
-                }
-            } catch (\Throwable $e) {
-                $this->log(sprintf('queue: [%d/%d] threw %s', $idx, $total, $e->getMessage()), 'WARN');
-            }
-            @unlink($f);
-        }
-        $this->log('queue: drain complete');
-    }
-
     // ====================================================================
-    //  Internal — block composition
+    //  Internal — 1-hop link expansion (used by findFacts)
     // ====================================================================
-
-    private function composeBlock(array $hits): string
-    {
-        if ($hits === []) {
-            return '';
-        }
-        // search only ever returns kind='memory' (the memories fts5 table is
-        // exclusively populated by refreshMemoryIndex from output/*.md). raw
-        // sources are not searchable — they are read by the ai during
-        // distillation and surface as curated md entries here.
-        $entries = [];
-        $seen = [];
-        $primarySlugs = [];
-        foreach ($hits as $hit) {
-            $slug = (string) ($hit['slug'] ?? '');
-            if ($slug === '' || isset($seen[$slug])) {
-                continue;
-            }
-            $seen[$slug] = true;
-            $primarySlugs[] = $slug;
-            $entry = $this->getMemory($slug);
-            if ($entry !== null) {
-                $entries[] = '## ' . $slug . "\n\n" . trim($entry['body']);
-            }
-        }
-        // 1-hop expansion via [[…]] links — pull in neighbours of every hit
-        // (both outgoing and incoming) so the model sees facts that the user's
-        // query didn't lexically match but that the curator marked as related.
-        foreach ($this->neighboursOf($primarySlugs, count($primarySlugs)) as $slug) {
-            if (isset($seen[$slug])) {
-                continue;
-            }
-            $seen[$slug] = true;
-            $entry = $this->getMemory($slug);
-            if ($entry !== null) {
-                $entries[] = '## ' . $slug . " (via [[…]] link)\n\n" . trim($entry['body']);
-            }
-        }
-        if ($entries === []) {
-            return '';
-        }
-        return "\n\n=== Memory ===\n\n" . implode("\n\n", $entries) . "\n\n=== /Memory ===\n";
-    }
 
     /**
      * Return up to `$maxAdd` slugs reachable from any of `$primarySlugs` via
-     * one hop in the link graph (either direction). The cap keeps the prompt
-     * bounded when an entry is heavily cross-referenced.
+     * one hop in the link graph (either direction). The cap keeps the
+     * returned fact set bounded when an entry is heavily cross-referenced.
      */
     private function neighboursOf(array $primarySlugs, int $maxAdd): array
     {
@@ -553,26 +416,6 @@ final class memhelper
             }
         }
         return array_keys($out);
-    }
-
-    private static function queryFromConversation(array $conversation): string
-    {
-        // last user message is the best signal for "what are we talking about
-        // right now" without paying for a summarisation LLM call. fall back to
-        // the last assistant message if no user turn is present.
-        for ($i = count($conversation) - 1; $i >= 0; $i--) {
-            $m = $conversation[$i];
-            if (($m['role'] ?? '') === 'user' && !empty($m['content'])) {
-                return (string) $m['content'];
-            }
-        }
-        for ($i = count($conversation) - 1; $i >= 0; $i--) {
-            $m = $conversation[$i];
-            if (!empty($m['content'])) {
-                return (string) $m['content'];
-            }
-        }
-        return '';
     }
 
     // ====================================================================
@@ -1807,59 +1650,8 @@ final class memhelper
     }
 
     // ====================================================================
-    //  Internal — auto-extraction + compaction (LLM-driven)
+    //  Internal — compaction (LLM-driven)
     // ====================================================================
-
-    private function extractAndPersist(array $conversation): void
-    {
-        if (!$this->aiAvailable()) {
-            $this->log('extract: ai not configured — skipping (set ai.provider + ai.model in config.yaml)', 'WARN');
-            return;
-        }
-        $existing = $this->listMemories();
-        $indexLines = array_map(
-            fn(array $e): string => '- ' . $e['slug'] . ' (' . ($e['type'] ?? 'reference') . '): ' . ($e['description'] ?? ''),
-            $existing
-        );
-        $convo = '';
-        foreach ($conversation as $m) {
-            $role = strtoupper((string) ($m['role'] ?? 'user'));
-            $content = (string) ($m['content'] ?? '');
-            $convo .= $role . ': ' . $content . "\n\n";
-        }
-        $prompt =
-            "You curate a long-term memory store for an LLM assistant. Decide which facts from the conversation below are worth saving as durable memory entries.\n\n" .
-            "Existing entries (slug → description):\n" .
-            ($indexLines === [] ? '(none yet)' : implode("\n", $indexLines)) .
-            "\n\nConversation:\n" .
-            $convo .
-            "\nReturn a JSON array of actions, each with:\n" .
-            "  action: \"add\" | \"update\" | \"delete\" | \"skip\"\n" .
-            "  slug: kebab-case (existing for update/delete, new for add)\n" .
-            "  content: full memory body (required for add/update)\n" .
-            "  description: one-line summary (required for add)\n" .
-            "  type: \"user\" | \"feedback\" | \"project\" | \"reference\" (required for add)\n\n" .
-            "Write `content` and `description` in the LANGUAGE OF THE CONVERSATION so retrieval matches the user's own phrasing.\n" .
-            "CROSS-LINK AGGRESSIVELY: whenever a fact references an entity (person, project, account, recurring concept), inline `[[that-slug]]`. This applies BOTH to slugs from the list above AND to slugs you are adding in this same response — entries you add can reference each other. An umbrella concept that ties several entries together should get its own hub entry with `[[…]]` links to each member. An entry without any `[[…]]` is almost always a missed opportunity unless the fact is genuinely standalone.\n\n" .
-            "Only include changes worth keeping. Return [] if nothing is worth saving. Respond with raw JSON, no markdown fences.";
-        $this->log(sprintf('extract: calling ai (%s/%s) with prompt of %d bytes', $this->aiConfig['provider'] ?? '?', $this->aiConfig['model'] ?? '?', strlen($prompt)));
-        $tStart = microtime(true);
-        try {
-            $raw = $this->callAi($prompt);
-        } catch (\Throwable $e) {
-            $this->log('extract: ai call failed — ' . $e->getMessage(), 'ERROR');
-            return;
-        }
-        $diff = self::decodeDiff($raw);
-        $this->log(sprintf('extract: ai responded in %.2fs (%d bytes), decoded %d action(s)', microtime(true) - $tStart, strlen($raw), count($diff)));
-        $counts = ['add' => 0, 'update' => 0, 'delete' => 0, 'skip' => 0];
-        foreach ($diff as $d) {
-            $a = (string) ($d['action'] ?? 'skip');
-            $counts[$a] = ($counts[$a] ?? 0) + 1;
-        }
-        $this->log(sprintf('extract: applying diff — add=%d update=%d delete=%d skip=%d', $counts['add'], $counts['update'], $counts['delete'], $counts['skip']));
-        $this->applyDiff($diff);
-    }
 
     private function compact(): void
     {
@@ -1970,8 +1762,8 @@ final class memhelper
         if (file_put_contents($path, $serialized) === false) {
             throw new RuntimeException('memhelper: failed to write memory file: ' . $path);
         }
-        // sync to the internal db immediately so the next enhance() call sees
-        // the new entry without waiting for the next worker tick.
+        // sync to the internal db immediately so the next findFacts() call
+        // sees the new entry without waiting for the next worker tick.
         $this->writeEntry(
             $slug,
             'memory',

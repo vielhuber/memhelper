@@ -8,7 +8,8 @@
         "ext-json": "*",
         "symfony/yaml": "^7.0",
         "vielhuber/aihelper": "*",
-        "vielhuber/dbhelper": "*"
+        "vielhuber/dbhelper": "*",
+        "vielhuber/simplemcp": "*"
     },
     "suggest": {
         "ext-pdo_sqlite": "Required for the internal FTS5 search index",
@@ -24,6 +25,7 @@
         "phpunit/phpunit": "^13"
     },
     "bin": [
-        "bin/memhelper-worker"
+        "bin/memhelper-worker",
+        "src/mcp-server.php"
     ]
 }

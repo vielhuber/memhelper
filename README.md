@@ -8,7 +8,7 @@
 
 # 🧠 memhelper 🧠
 
-Markdown-first memory layer for LLM agents. One static call enhances a prompt with the relevant facts from your memory store. A separate supervisor worker handles all writes — extracting new facts from queued conversations, refreshing the search index across every configured database, and periodically compacting duplicates and obsolete entries. Memory entries are plain `.md` files with a tiny YAML frontmatter — readable, editable, git-versionable. The search index is replicated across as many SQLite, MySQL and PostgreSQL backends as you list in `config.yaml`.
+Markdown-first memory layer for LLM agents. Exposes a `find_facts(query)` MCP tool that returns the curated facts most relevant to a natural-language question. A separate supervisor worker handles all writes — refreshing the search index across every configured input source, distilling new sources via an LLM, and periodically compacting duplicates and obsolete entries. Memory entries are plain `.md` files with a tiny YAML frontmatter — readable, editable, git-versionable. Cross-references between entries are written as `[[slug]]` wiki-links and followed one hop at retrieval time, so a single query surfaces related neighbours automatically.
 
 ## installation
 
@@ -51,6 +51,8 @@ input_dbs:
 
 ## usage
 
+### library
+
 ```php
 use vielhuber\memhelper\memhelper;
 
@@ -59,14 +61,16 @@ $memory = new memhelper(
     logPath: '/var/log/memory.log'
 );
 
-$prompt = $memory->enhance($conversation) . $prompt;
+$facts = $memory->findFacts('how is the user\'s dog named?', limit: 10);
+// → [['slug' => 'pet-roger', 'type' => 'user', 'description' => '...',
+//     'body' => '...', 'score' => -3.41, 'via' => null], ...]
 ```
 
 ## worker
 
 ```ini
 [program:memhelper-worker]
-command=php /app/vendor/vielhuber/memhelper/bin/memhelper-worker
+command=php /app/vendor/vielhuber/memhelper/bin/memhelper-worker /path/to/memory.yaml /var/log/memory.log
 autostart=true
 autorestart=true
 ```
@@ -75,4 +79,21 @@ autorestart=true
 
 ```bash
 ./vendor/bin/phpunit
+```
+
+### mcp
+
+```json
+{
+    "mcpServers": {
+        "memory": {
+            "command": "php",
+            "args": ["./vendor/bin/mcp-server.php"],
+            "env": {
+                "MEMHELPER_CONFIG": "/path/to/memory.yaml",
+                "MEMHELPER_LOG": "/var/log/memory.log"
+            }
+        }
+    }
+}
 ```
