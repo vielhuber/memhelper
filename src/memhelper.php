@@ -69,16 +69,12 @@ final class memhelper
 
         $this->aiConfig = is_array($cfg['ai'] ?? null) ? $cfg['ai'] : [];
 
-        // internal database — required, always sqlite. holds the FTS5 index,
-        // the per-slug state table and any future vector tables. separate from
-        // anything the host application owns.
-        $dbPath = (string) ($cfg['database'] ?? '');
-        if ($dbPath === '') {
-            throw new RuntimeException('memhelper: database (absolute sqlite path) is required in config.yaml');
-        }
+        // internal database — always sqlite, always lives under .data/ of the
+        // output directory. no user-facing config knob, no path-collision risk.
+        $dbPath = $this->output . '/.data/memhelper.db';
         $dbDir = dirname($dbPath);
         if (!is_dir($dbDir) && !@mkdir($dbDir, 0775, true) && !is_dir($dbDir)) {
-            throw new RuntimeException('memhelper: database dir does not exist and could not be created: ' . $dbDir);
+            throw new RuntimeException('memhelper: internal db dir could not be created: ' . $dbDir);
         }
         $this->db = new dbhelper();
         $this->db->connect('pdo', 'sqlite', $dbPath);
@@ -306,34 +302,19 @@ final class memhelper
      */
     public function work(): void
     {
-        // file-based lock — flock is atomic and the OS releases the lock when
-        // the process dies, so a crash mid-tick can't leave a stale sentinel.
-        // a long-running tick (initial bulk index, big compaction) makes the
-        // next 30 s polling cycle find the lock taken and exit silently.
-        $dataDir = $this->dataDir();
-        if (!is_dir($dataDir) && !@mkdir($dataDir, 0775, true) && !is_dir($dataDir)) {
-            $this->log('failed to create data dir: ' . $dataDir, 'ERROR');
-            return;
-        }
-        $lockPath = $dataDir . '/tick.lock';
-        $fp = @fopen($lockPath, 'c');
-        if ($fp === false) {
-            $this->log('failed to open tick.lock', 'ERROR');
-            return;
-        }
-        if (!flock($fp, LOCK_EX | LOCK_NB)) {
+        // db-based lock with PID + TTL — crash-safe across process death via
+        // the posix-kill liveness check and a 1 h staleness fallback. avoids
+        // a stray .data/tick.lock file on disk.
+        if (!$this->acquireTickLock()) {
             $this->log('another tick is still running, skipping');
-            fclose($fp);
             return;
         }
         $tStart = microtime(true);
         $this->log('tick start');
         try {
-            @ftruncate($fp, 0);
-            @fwrite($fp, (string) getmypid());
             // phase 1: conversations → ai extracts facts → md files
             $this->processQueue();
-            // phase 2: input_files (and later input_dbs) → state.body, no fts5
+            // phase 2: input_files + input_dbs → state.body, no fts5
             $this->refreshSources();
             // phase 3: ai distils undistilled / changed sources → md files
             $this->distillSources();
@@ -352,9 +333,75 @@ final class memhelper
             $this->log('tick aborted: ' . $e->getMessage(), 'ERROR');
             throw $e;
         } finally {
-            flock($fp, LOCK_UN);
-            fclose($fp);
+            $this->releaseTickLock();
         }
+    }
+
+    private const TICK_LOCK_KEY = 'tick_lock';
+    private const TICK_LOCK_TTL_SECONDS = 3600;
+    private const COMPACT_KEY = 'last_compact';
+    private const COMPACT_INTERVAL_SECONDS = 86400;
+
+    private function acquireTickLock(): bool
+    {
+        $now = time();
+        $myPid = getmypid();
+        try {
+            $row = $this->db->fetch_row(
+                'SELECT value, updated_at FROM memhelper_meta WHERE key = ?',
+                self::TICK_LOCK_KEY
+            );
+            if ($row !== null) {
+                $heldPid = (int) ($row['value'] ?? 0);
+                $heldAt = (int) ($row['updated_at'] ?? 0);
+                $fresh = ($now - $heldAt) < self::TICK_LOCK_TTL_SECONDS;
+                $alive = $this->isProcessAlive($heldPid);
+                if ($fresh && $alive) {
+                    return false;
+                }
+                // stale (owner dead or older than TTL) → take it over.
+                $this->log(sprintf(
+                    'tick lock: takeover stale lock (pid=%d alive=%s held %ds ago)',
+                    $heldPid, $alive ? 'yes' : 'no', $now - $heldAt
+                ), 'WARN');
+                $this->db->update(
+                    'memhelper_meta',
+                    ['value' => (string) $myPid, 'updated_at' => $now],
+                    ['key' => self::TICK_LOCK_KEY]
+                );
+                return true;
+            }
+            $this->db->insert('memhelper_meta', [
+                'key' => self::TICK_LOCK_KEY,
+                'value' => (string) $myPid,
+                'updated_at' => $now
+            ]);
+            return true;
+        } catch (\Throwable $e) {
+            $this->log('tick lock: failed to acquire: ' . $e->getMessage(), 'ERROR');
+            return false;
+        }
+    }
+
+    private function releaseTickLock(): void
+    {
+        try {
+            $this->db->delete('memhelper_meta', ['key' => self::TICK_LOCK_KEY]);
+        } catch (\Throwable) {
+            // best effort — next tick will detect a stale row anyway.
+        }
+    }
+
+    private function isProcessAlive(int $pid): bool
+    {
+        if ($pid <= 0) {
+            return false;
+        }
+        if (function_exists('posix_kill')) {
+            return @posix_kill($pid, 0);
+        }
+        // linux fallback: /proc/<pid> exists for live processes
+        return is_dir('/proc/' . $pid);
     }
 
     // ====================================================================
@@ -538,11 +585,12 @@ final class memhelper
 
     private function initSchemaSqlite(dbhelper $db): void
     {
-        // detect schema drift (older deployments missing kind/body/distilled_at)
-        // and drop — derived state, cheap to redo from disk.
+        // detect schema drift (older deployments missing kind/body/distilled_at
+        // or the meta table) and drop — derived state, cheap to redo from disk.
         try {
             $db->fetch_var('SELECT kind FROM memories LIMIT 0');
             $db->fetch_var('SELECT body, distilled_at FROM memhelper_state LIMIT 0');
+            $db->fetch_var('SELECT value, updated_at FROM memhelper_meta LIMIT 0');
         } catch (\Throwable) {
             $db->query('DROP TABLE IF EXISTS memories');
             $db->query('DROP TABLE IF EXISTS memhelper_meta');
@@ -572,6 +620,17 @@ final class memhelper
             )'
         );
         $db->query('CREATE INDEX IF NOT EXISTS memhelper_state_kind ON memhelper_state(kind)');
+        // memhelper_meta: singleton-ish bookkeeping that does not belong to a
+        // single slug. used for the tick lock (key=tick_lock, value=pid,
+        // updated_at=when-acquired) and the compaction sentinel (key=last_compact,
+        // updated_at=when-last-run). avoids stray files under .data/.
+        $db->query(
+            'CREATE TABLE IF NOT EXISTS memhelper_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at INTEGER NOT NULL
+            )'
+        );
     }
 
     private function writeEntry(string $slug, string $kind, string $title, string $body, int $mtime): void
@@ -774,24 +833,17 @@ final class memhelper
      */
     private function refreshSources(): void
     {
-        // always announce what's configured so the operator can verify the
-        // resolved config is picked up. avoids the silent-skip footgun where
-        // an empty input_dbs section looks identical to a misread one.
         $this->log(sprintf(
             'sources: scan starting — %d files dir(s), %d input_db(s) configured',
             count($this->filesDirs),
             count($this->inputDbs)
         ));
-        if ($this->inputDbs !== []) {
-            foreach ($this->inputDbs as $i => $dbc) {
-                $driver = (string) ($dbc['driver'] ?? '?');
-                $where = $driver === 'sqlite'
-                    ? (string) ($dbc['path'] ?? '?')
-                    : sprintf('%s@%s', $dbc['user'] ?? '?', $dbc['host'] ?? '?');
-                $this->log(sprintf('input_dbs: [%d] driver=%s target=%s', $i + 1, $driver, $where));
-            }
-            $this->log('input_dbs: db-row indexing is not yet implemented — sources will only come from files', 'WARN');
-        }
+        $this->refreshFileSources();
+        $this->refreshDbSources();
+    }
+
+    private function refreshFileSources(): void
+    {
         if ($this->filesDirs === []) {
             return;
         }
@@ -904,6 +956,509 @@ final class memhelper
             $this->progress($tag, $done, $total, "updated " . basename($info['path']));
         }
         $this->log(sprintf('sources: complete in %.2fs', microtime(true) - $tStart));
+    }
+
+    // Auto-discovery limits + blacklist patterns. Hardcoded for now — these
+    // are heuristics, not policy knobs. Move to config if real deployments
+    // need different defaults.
+    private const DB_TABLE_ROW_CAP = 50000;
+    private const DB_TABLE_BLACKLIST_EXACT = [
+        'migrations', 'migration_versions', 'phinxlog', 'phinxlog_default',
+        'jobs', 'job_batches', 'failed_jobs',
+        'cache', 'cache_locks',
+        'sessions',
+        'password_reset_tokens', 'personal_access_tokens',
+    ];
+    private const DB_TABLE_BLACKLIST_PREFIX = [
+        'sqlite_', 'oauth_', 'telescope_', 'pulse_', 'horizon_',
+    ];
+    private const DB_TABLE_BLACKLIST_SUFFIX = [
+        '_log', '_logs', '_audit', '_history', '_tmp', '_temp', '_cache', '_queue', '_queues',
+    ];
+    private const DB_TABLE_BLACKLIST_CONTAINS = [
+        'migration',
+    ];
+    private const DB_COLUMN_BLACKLIST_EXACT = [
+        'password', 'password_hash', 'remember_token', 'csrf_token',
+        'session_data',
+    ];
+    /** Skip a column when its name matches any of these regexes (sensitive
+     *  data, foreign keys, timestamps, fingerprints — all noise for memory). */
+    private const DB_COLUMN_BLACKLIST_PATTERNS = [
+        '/_id$/',
+        '/_at$/',
+        '/^timestamp_/',
+        '/_token$/',
+        '/_secret$/',
+        '/_hash$/',
+        '/_key$/',
+        '/password/',
+    ];
+
+    /**
+     * Walk every configured input_db, auto-discover tables, drop the noisy
+     * ones, and stage each row as a kind='source' entry. Alias is derived
+     * from the db filename (sqlite) or database name (mysql/postgres). No
+     * per-table config — column selection is heuristic and conservative.
+     */
+    private function refreshDbSources(): void
+    {
+        if ($this->inputDbs === []) {
+            return;
+        }
+        $usedAliases = [];
+        foreach ($this->inputDbs as $idx => $dbc) {
+            if (!is_array($dbc)) {
+                continue;
+            }
+            $alias = $this->deriveAlias($dbc, $usedAliases);
+            $usedAliases[$alias] = true;
+            $driver = strtolower((string) ($dbc['driver'] ?? '?'));
+            $target = $driver === 'sqlite'
+                ? (string) ($dbc['path'] ?? '?')
+                : sprintf('%s@%s', $dbc['user'] ?? '?', $dbc['host'] ?? '?');
+            $this->log(sprintf('input_dbs: [%d] alias=%s driver=%s target=%s', $idx + 1, $alias, $driver, $target));
+            $source = $this->openInputDb($dbc, $alias);
+            if ($source === null) {
+                continue;
+            }
+            try {
+                $tables = $this->discoverTables($source, $dbc);
+            } catch (\Throwable $e) {
+                $this->log("input_dbs[$alias]: discovery failed — " . $e->getMessage(), 'WARN');
+                continue;
+            }
+            if ($tables === []) {
+                $this->log("input_dbs[$alias]: no tables discovered");
+                continue;
+            }
+            $this->log(sprintf('input_dbs[%s]: discovered %d table(s)', $alias, count($tables)));
+            foreach ($tables as $t) {
+                $tn = $t['name'];
+                if (self::isTableBlacklisted($tn)) {
+                    $this->log("input_dbs[$alias:$tn]: skip — blacklisted");
+                    continue;
+                }
+                if ($t['pkName'] === null) {
+                    $this->log("input_dbs[$alias:$tn]: skip — no single-column primary key");
+                    continue;
+                }
+                if ($t['rowCount'] > self::DB_TABLE_ROW_CAP) {
+                    $this->log(sprintf(
+                        'input_dbs[%s:%s]: skip — %d rows > cap (%d)',
+                        $alias, $tn, $t['rowCount'], self::DB_TABLE_ROW_CAP
+                    ));
+                    continue;
+                }
+                $contentCols = $this->pickIndexableColumns($t['columns'], $t['pkName']);
+                if ($contentCols === []) {
+                    $this->log("input_dbs[$alias:$tn]: skip — no indexable text columns");
+                    continue;
+                }
+                try {
+                    $this->refreshDbTable($source, $alias, $tn, $t['pkName'], $contentCols);
+                } catch (\Throwable $e) {
+                    $this->log(sprintf(
+                        'input_dbs[%s:%s]: failed — %s',
+                        $alias, $tn, $e->getMessage()
+                    ), 'WARN');
+                }
+            }
+        }
+    }
+
+    private function deriveAlias(array $dbc, array $used): string
+    {
+        $driver = strtolower((string) ($dbc['driver'] ?? ''));
+        $base = match ($driver) {
+            'sqlite' => self::aliasSlug(pathinfo((string) ($dbc['path'] ?? 'db'), PATHINFO_FILENAME)),
+            'mysql', 'postgres' => self::aliasSlug((string) ($dbc['database'] ?? ($dbc['host'] ?? 'db'))),
+            default => 'db',
+        };
+        if ($base === '') {
+            $base = 'db';
+        }
+        $alias = $base;
+        $i = 2;
+        while (isset($used[$alias])) {
+            $alias = $base . '-' . $i++;
+        }
+        return $alias;
+    }
+
+    private static function aliasSlug(string $s): string
+    {
+        $s = strtolower($s);
+        $s = preg_replace('/[^a-z0-9]+/', '-', $s) ?? '';
+        return trim($s, '-');
+    }
+
+    private static function isTableBlacklisted(string $name): bool
+    {
+        $n = strtolower($name);
+        if (in_array($n, self::DB_TABLE_BLACKLIST_EXACT, true)) {
+            return true;
+        }
+        foreach (self::DB_TABLE_BLACKLIST_PREFIX as $p) {
+            if (str_starts_with($n, $p)) return true;
+        }
+        foreach (self::DB_TABLE_BLACKLIST_SUFFIX as $s) {
+            if (str_ends_with($n, $s)) return true;
+        }
+        foreach (self::DB_TABLE_BLACKLIST_CONTAINS as $c) {
+            if (str_contains($n, $c)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Pick the columns that should contribute to the per-row source body.
+     * Conservative: only text-affinity types, then drop ids/timestamps/
+     * secrets. The pk is excluded too — it's the slug, not body content.
+     */
+    private function pickIndexableColumns(array $columns, string $pkName): array
+    {
+        $picked = [];
+        foreach ($columns as $c) {
+            $name = (string) $c['name'];
+            if ($name === $pkName) continue;
+            if (!self::isTextAffinity((string) $c['type'])) continue;
+            $low = strtolower($name);
+            if (in_array($low, self::DB_COLUMN_BLACKLIST_EXACT, true)) continue;
+            $skip = false;
+            foreach (self::DB_COLUMN_BLACKLIST_PATTERNS as $p) {
+                if (preg_match($p, $low)) { $skip = true; break; }
+            }
+            if ($skip) continue;
+            $picked[] = $name;
+        }
+        return $picked;
+    }
+
+    /** Text-affinity by declared type — covers sqlite, mysql, postgres
+     *  consistently. JSON columns are TEXT but skipped: too noisy. */
+    private static function isTextAffinity(string $declaredType): bool
+    {
+        $t = strtolower($declaredType);
+        if ($t === '') return false;
+        if (str_contains($t, 'json')) return false;
+        if (str_contains($t, 'uuid')) return false;
+        return str_contains($t, 'char')
+            || str_contains($t, 'text')
+            || str_contains($t, 'clob')
+            || str_contains($t, 'enum');
+    }
+
+    /**
+     * Discover all tables for one input_db. Returns array of
+     * {name, pkName|null, columns:[{name,type},...], rowCount}.
+     */
+    private function discoverTables(dbhelper $source, array $dbc): array
+    {
+        $driver = strtolower((string) ($dbc['driver'] ?? ''));
+        return match ($driver) {
+            'sqlite' => $this->discoverSqliteTables($source),
+            'mysql' => $this->discoverMysqlTables($source, (string) ($dbc['database'] ?? '')),
+            'postgres' => $this->discoverPostgresTables($source),
+            default => [],
+        };
+    }
+
+    private function discoverSqliteTables(dbhelper $source): array
+    {
+        $rows = $source->fetch_all(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        ) ?: [];
+        $out = [];
+        foreach ($rows as $r) {
+            $name = (string) $r['name'];
+            $info = $source->fetch_all('PRAGMA table_info("' . str_replace('"', '""', $name) . '")') ?: [];
+            $pk = null;
+            $compositePk = false;
+            $cols = [];
+            foreach ($info as $c) {
+                $cols[] = ['name' => (string) $c['name'], 'type' => (string) $c['type']];
+                if ((int) ($c['pk'] ?? 0) > 0) {
+                    if ($pk !== null) {
+                        $compositePk = true;
+                    } else {
+                        $pk = (string) $c['name'];
+                    }
+                }
+            }
+            $count = (int) ($source->fetch_var('SELECT COUNT(*) FROM "' . str_replace('"', '""', $name) . '"') ?? 0);
+            $out[] = [
+                'name' => $name,
+                'pkName' => $compositePk ? null : $pk,
+                'columns' => $cols,
+                'rowCount' => $count,
+            ];
+        }
+        return $out;
+    }
+
+    private function discoverMysqlTables(dbhelper $source, string $database): array
+    {
+        $rows = $source->fetch_all(
+            "SELECT table_name FROM information_schema.tables
+             WHERE table_schema = ? AND table_type = 'BASE TABLE'
+             ORDER BY table_name",
+            $database
+        ) ?: [];
+        $out = [];
+        foreach ($rows as $r) {
+            $name = (string) ($r['table_name'] ?? $r['TABLE_NAME'] ?? '');
+            if ($name === '') continue;
+            $colRows = $source->fetch_all(
+                "SELECT column_name, data_type, column_key
+                 FROM information_schema.columns
+                 WHERE table_schema = ? AND table_name = ?
+                 ORDER BY ordinal_position",
+                $database, $name
+            ) ?: [];
+            $pk = null;
+            $compositePk = false;
+            $cols = [];
+            foreach ($colRows as $c) {
+                $cn = (string) ($c['column_name'] ?? $c['COLUMN_NAME'] ?? '');
+                $ct = (string) ($c['data_type'] ?? $c['DATA_TYPE'] ?? '');
+                $ck = (string) ($c['column_key'] ?? $c['COLUMN_KEY'] ?? '');
+                $cols[] = ['name' => $cn, 'type' => $ct];
+                if ($ck === 'PRI') {
+                    if ($pk !== null) {
+                        $compositePk = true;
+                    } else {
+                        $pk = $cn;
+                    }
+                }
+            }
+            $count = (int) ($source->fetch_var('SELECT COUNT(*) FROM `' . str_replace('`', '``', $name) . '`') ?? 0);
+            $out[] = [
+                'name' => $name,
+                'pkName' => $compositePk ? null : $pk,
+                'columns' => $cols,
+                'rowCount' => $count,
+            ];
+        }
+        return $out;
+    }
+
+    private function discoverPostgresTables(dbhelper $source): array
+    {
+        $rows = $source->fetch_all(
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename"
+        ) ?: [];
+        $out = [];
+        foreach ($rows as $r) {
+            $name = (string) ($r['tablename'] ?? '');
+            if ($name === '') continue;
+            $colRows = $source->fetch_all(
+                "SELECT column_name, data_type FROM information_schema.columns
+                 WHERE table_schema = 'public' AND table_name = ?
+                 ORDER BY ordinal_position",
+                $name
+            ) ?: [];
+            $cols = [];
+            foreach ($colRows as $c) {
+                $cols[] = [
+                    'name' => (string) ($c['column_name'] ?? ''),
+                    'type' => (string) ($c['data_type'] ?? ''),
+                ];
+            }
+            $pkRows = $source->fetch_all(
+                "SELECT a.attname AS pk
+                 FROM pg_index i JOIN pg_attribute a
+                   ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                 WHERE i.indrelid = ?::regclass AND i.indisprimary",
+                '"' . str_replace('"', '""', $name) . '"'
+            ) ?: [];
+            $pk = null;
+            $compositePk = count($pkRows) > 1;
+            if (count($pkRows) === 1) {
+                $pk = (string) $pkRows[0]['pk'];
+            }
+            $count = (int) ($source->fetch_var('SELECT COUNT(*) FROM "' . str_replace('"', '""', $name) . '"') ?? 0);
+            $out[] = [
+                'name' => $name,
+                'pkName' => $compositePk ? null : $pk,
+                'columns' => $cols,
+                'rowCount' => $count,
+            ];
+        }
+        return $out;
+    }
+
+    private function openInputDb(array $dbc, string $alias): ?dbhelper
+    {
+        $driver = strtolower((string) ($dbc['driver'] ?? ''));
+        try {
+            $h = new dbhelper();
+            if ($driver === 'sqlite') {
+                $path = (string) ($dbc['path'] ?? '');
+                if ($path === '' || !is_file($path)) {
+                    $this->log("input_dbs[$alias]: sqlite path not found: $path", 'WARN');
+                    return null;
+                }
+                $h->connect('pdo', 'sqlite', $path);
+                return $h;
+            }
+            if ($driver === 'mysql' || $driver === 'postgres') {
+                $h->connect(
+                    'pdo',
+                    $driver,
+                    (string) ($dbc['host'] ?? '127.0.0.1'),
+                    (string) ($dbc['user'] ?? ''),
+                    (string) ($dbc['password'] ?? ''),
+                    (string) ($dbc['database'] ?? ''),
+                    (int) ($dbc['port'] ?? ($driver === 'mysql' ? 3306 : 5432))
+                );
+                return $h;
+            }
+            $this->log("input_dbs[$alias]: unsupported driver '$driver'", 'WARN');
+            return null;
+        } catch (\Throwable $e) {
+            $this->log("input_dbs[$alias]: connect failed — " . $e->getMessage(), 'WARN');
+            return null;
+        }
+    }
+
+    /**
+     * Index one table from an external db. Builds a per-row body from the
+     * pre-selected text columns, diffs against memhelper_state by sha1, and
+     * writes add/update/remove as needed. The source db is read-only — we
+     * only SELECT.
+     *
+     * @param list<string> $contentCols
+     */
+    private function refreshDbTable(
+        dbhelper $source,
+        string $alias,
+        string $table,
+        string $pkCol,
+        array $contentCols
+    ): void {
+        $tStart = microtime(true);
+
+        // load current state for this alias+table
+        $prefix = sprintf('dbrow:%s:%s:', $alias, $table);
+        $stateRows = $this->db->fetch_all(
+            "SELECT slug, hash FROM memhelper_state WHERE kind = 'source' AND slug LIKE ?",
+            $prefix . '%'
+        ) ?: [];
+        $current = [];
+        foreach ($stateRows as $r) {
+            $current[(string) $r['slug']] = (string) $r['hash'];
+        }
+
+        // page through the source table; never load everything at once
+        $cols = array_unique(array_merge([$pkCol], $contentCols));
+        $colList = implode(', ', array_map(static fn(string $c): string => '"' . $c . '"', $cols));
+        $batchSize = 500;
+        $offset = 0;
+        $seen = [];
+        $toAdd = [];
+        $toUpdate = [];
+        $unchanged = 0;
+
+        while (true) {
+            $rows = $source->fetch_all(
+                sprintf('SELECT %s FROM "%s" ORDER BY "%s" LIMIT %d OFFSET %d',
+                    $colList, $table, $pkCol, $batchSize, $offset)
+            ) ?: [];
+            if ($rows === []) {
+                break;
+            }
+            foreach ($rows as $row) {
+                $pkVal = $row[$pkCol] ?? null;
+                if ($pkVal === null || $pkVal === '') {
+                    continue;
+                }
+                $slug = $prefix . (string) $pkVal;
+                $parts = [];
+                foreach ($contentCols as $c) {
+                    $v = $row[$c] ?? null;
+                    if ($v === null || $v === '') {
+                        continue;
+                    }
+                    $parts[] = $c . ': ' . (string) $v;
+                }
+                if ($parts === []) {
+                    continue;
+                }
+                $body = implode("\n", $parts);
+                $hash = sha1($body);
+                $seen[$slug] = ['body' => $body, 'hash' => $hash];
+                if (!isset($current[$slug])) {
+                    $toAdd[$slug] = ['body' => $body, 'hash' => $hash];
+                } elseif ($current[$slug] !== $hash) {
+                    $toUpdate[$slug] = ['body' => $body, 'hash' => $hash];
+                } else {
+                    $unchanged++;
+                }
+            }
+            $offset += $batchSize;
+        }
+
+        $toRemove = [];
+        foreach (array_keys($current) as $slug) {
+            if (!isset($seen[$slug])) {
+                $toRemove[] = $slug;
+            }
+        }
+
+        $total = count($toAdd) + count($toUpdate) + count($toRemove);
+        if ($total === 0) {
+            $this->log(sprintf(
+                'input_dbs[%s:%s]: nothing changed — unchanged=%d (%.2fs)',
+                $alias, $table, $unchanged, microtime(true) - $tStart
+            ));
+            return;
+        }
+        $this->log(sprintf(
+            'input_dbs[%s:%s]: plan — add=%d update=%d remove=%d unchanged=%d',
+            $alias, $table, count($toAdd), count($toUpdate), count($toRemove), $unchanged
+        ));
+
+        $tag = "input_dbs[$alias:$table]";
+        $done = 0;
+        foreach ($toRemove as $slug) {
+            $this->db->delete('memhelper_state', ['slug' => $slug]);
+            $done++;
+            $this->progress($tag, $done, $total, "removed $slug");
+        }
+        foreach ($toAdd as $slug => $r) {
+            $this->db->insert('memhelper_state', [
+                'slug' => $slug,
+                'kind' => 'source',
+                'mtime' => time(),
+                'hash' => $r['hash'],
+                'body' => $r['body'],
+                'indexed_at' => time()
+                // distilled_at intentionally null — distillSources() will pick it up
+            ]);
+            $done++;
+            $this->progress($tag, $done, $total, "added $slug");
+        }
+        foreach ($toUpdate as $slug => $r) {
+            // delete+insert so distilled_at resets to null and the row is
+            // re-distilled on the next pass; an UPDATE would leave the old
+            // distilled_at in place.
+            $this->db->delete('memhelper_state', ['slug' => $slug]);
+            $this->db->insert('memhelper_state', [
+                'slug' => $slug,
+                'kind' => 'source',
+                'mtime' => time(),
+                'hash' => $r['hash'],
+                'body' => $r['body'],
+                'indexed_at' => time()
+            ]);
+            $done++;
+            $this->progress($tag, $done, $total, "updated $slug");
+        }
+        $this->log(sprintf(
+            'input_dbs[%s:%s]: complete in %.2fs',
+            $alias, $table, microtime(true) - $tStart
+        ));
     }
 
     /**
@@ -1131,38 +1686,30 @@ final class memhelper
             return;
         }
         $diff = self::decodeDiff($raw);
-        $this->log(sprintf('compact: ai responded in %.2fs, decoded %d action(s) — backing up before apply', microtime(true) - $tStart, count($diff)));
-        $this->backup();
+        $this->log(sprintf('compact: ai responded in %.2fs, decoded %d action(s)', microtime(true) - $tStart, count($diff)));
         $this->applyDiff($diff);
     }
 
     private function shouldCompact(): bool
     {
-        $sentinel = $this->dataDir() . '/last_compact';
-        if (!is_file($sentinel)) {
-            return true;
-        }
-        $last = (int) trim((string) @file_get_contents($sentinel));
-        return time() - $last > 24 * 3600;
+        $last = (int) ($this->db->fetch_var(
+            'SELECT updated_at FROM memhelper_meta WHERE key = ?',
+            self::COMPACT_KEY
+        ) ?: 0);
+        return time() - $last > self::COMPACT_INTERVAL_SECONDS;
     }
 
     private function markCompacted(): void
     {
-        $dataDir = $this->dataDir();
-        if (!is_dir($dataDir) && !@mkdir($dataDir, 0775, true)) {
-            return;
-        }
-        @file_put_contents($dataDir . '/last_compact', (string) time());
-    }
-
-    private function backup(): void
-    {
-        $dir = $this->dataDir() . '/backup/' . date('Ymd-His');
-        if (!@mkdir($dir, 0775, true) && !is_dir($dir)) {
-            return;
-        }
-        foreach (glob($this->output . '/*.md') ?: [] as $file) {
-            @copy($file, $dir . '/' . basename($file));
+        try {
+            $this->db->delete('memhelper_meta', ['key' => self::COMPACT_KEY]);
+            $this->db->insert('memhelper_meta', [
+                'key' => self::COMPACT_KEY,
+                'value' => '',
+                'updated_at' => time()
+            ]);
+        } catch (\Throwable) {
+            // best effort — at worst compaction runs again next day
         }
     }
 
