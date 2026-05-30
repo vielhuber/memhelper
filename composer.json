@@ -11,9 +11,8 @@
         "vielhuber/dbhelper": "*"
     },
     "suggest": {
-        "ext-pdo_sqlite": "For SQLite-backed FTS5 search index",
-        "ext-pdo_mysql": "For MySQL FULLTEXT search backend",
-        "ext-pdo_pgsql": "For PostgreSQL tsvector search backend",
+        "ext-pdo_sqlite": "Required for the internal FTS5 search index",
+        "ext-zip": "Required to index .docx and .xlsx attachments",
         "poppler-utils": "Provides pdftotext for indexing PDFs"
     },
     "autoload": {

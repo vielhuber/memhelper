@@ -327,8 +327,15 @@ final class memhelper
         try {
             @ftruncate($fp, 0);
             @fwrite($fp, (string) getmypid());
+            // phase 1: conversations → ai extracts facts → md files
             $this->processQueue();
-            $this->refreshIndexes();
+            // phase 2: input_files (and later input_dbs) → state.body, no fts5
+            $this->refreshSources();
+            // phase 3: ai distils undistilled / changed sources → md files
+            $this->distillSources();
+            // phase 4: sync the curated md files into the fts5 search index
+            $this->refreshMemoryIndex();
+            // phase 5: periodic compaction
             if ($this->shouldCompact()) {
                 $this->log('compaction is due (last run > 24 h ago)');
                 $this->compact();
@@ -423,6 +430,10 @@ final class memhelper
         if ($hits === []) {
             return '';
         }
+        // search only ever returns kind='memory' (the memories fts5 table is
+        // exclusively populated by refreshMemoryIndex from output/*.md). raw
+        // sources are not searchable — they are read by the ai during
+        // distillation and surface as curated md entries here.
         $entries = [];
         $seen = [];
         foreach ($hits as $hit) {
@@ -431,18 +442,9 @@ final class memhelper
                 continue;
             }
             $seen[$slug] = true;
-            $kind = (string) ($hit['kind'] ?? 'memory');
-            if ($kind === 'memory') {
-                $entry = $this->getMemory($slug);
-                if ($entry !== null) {
-                    $entries[] = '## ' . $slug . "\n\n" . trim($entry['body']);
-                }
-            } else {
-                $path = self::slugToPath($slug);
-                if ($path !== null) {
-                    $snippet = (string) ($hit['snippet'] ?? '');
-                    $entries[] = '## ' . basename($path) . ' (' . $path . ')' . "\n\n" . trim($snippet);
-                }
+            $entry = $this->getMemory($slug);
+            if ($entry !== null) {
+                $entries[] = '## ' . $slug . "\n\n" . trim($entry['body']);
             }
         }
         if ($entries === []) {
@@ -532,25 +534,37 @@ final class memhelper
 
     private function initSchemaSqlite(dbhelper $db): void
     {
-        // detect older index files lacking the `kind` column and drop so the
-        // schema below creates the current layout. derived state — cheap to redo.
+        // detect schema drift (older deployments missing kind/body/distilled_at)
+        // and drop — derived state, cheap to redo from disk.
         try {
             $db->fetch_var('SELECT kind FROM memories LIMIT 0');
+            $db->fetch_var('SELECT body, distilled_at FROM memhelper_state LIMIT 0');
         } catch (\Throwable) {
             $db->query('DROP TABLE IF EXISTS memories');
             $db->query('DROP TABLE IF EXISTS memhelper_meta');
             $db->query('DROP TABLE IF EXISTS memhelper_state');
         }
+        // memories: ONLY curated md entries (kind='memory'). sources never
+        // land here — they are read by the ai during distillation, then the
+        // resulting memory entries get indexed.
         $db->query(
             'CREATE VIRTUAL TABLE IF NOT EXISTS memories USING fts5(slug UNINDEXED, kind UNINDEXED, title, body, tokenize="unicode61 remove_diacritics 2")'
         );
+        // memhelper_state: bookkeeping for every tracked artefact.
+        //   kind='memory' — a curated md in output/, mirrors a memories row.
+        //   kind='source' — a raw input (file or db row); body holds the
+        //                    extracted text the ai distills from.
+        //   distilled_at — for sources only: when the ai last summarised the
+        //                   body into memory entries. null = needs work.
         $db->query(
             'CREATE TABLE IF NOT EXISTS memhelper_state (
                 slug TEXT PRIMARY KEY,
                 kind TEXT NOT NULL,
                 mtime INTEGER NOT NULL,
                 hash TEXT NOT NULL,
-                indexed_at INTEGER NOT NULL
+                body TEXT,
+                indexed_at INTEGER NOT NULL,
+                distilled_at INTEGER
             )'
         );
         $db->query('CREATE INDEX IF NOT EXISTS memhelper_state_kind ON memhelper_state(kind)');
@@ -582,6 +596,27 @@ final class memhelper
     }
 
     /**
+     * Record a file as known-unsupported so subsequent ticks don't call the
+     * extractor again. The state row keeps it in `current`, the mtime check
+     * matches unless someone re-saves the file, and the sentinel hash makes
+     * the kind distinguishable from a real index entry.
+     */
+    private const SKIPPED_HASH = '__unsupported__';
+
+    private function markSkipped(string $slug, int $mtime): void
+    {
+        $this->db->delete('memories', ['slug' => $slug]);
+        $this->db->delete('memhelper_state', ['slug' => $slug]);
+        $this->db->insert('memhelper_state', [
+            'slug' => $slug,
+            'kind' => 'attached',
+            'mtime' => $mtime,
+            'hash' => self::SKIPPED_HASH,
+            'indexed_at' => time()
+        ]);
+    }
+
+    /**
      * Drop rows that exist in `memories` but have no matching state — happens
      * after schema upgrades or out-of-band DB tampering. Keeps state
      * authoritative without paying for a full rebuild.
@@ -604,33 +639,15 @@ final class memhelper
     //  Internal — index refresh from disk (markdown + files dirs)
     // ====================================================================
 
-    private function refreshIndexes(): void
-    {
-        $this->log(sprintf(
-            'index refresh: %d files dir(s), %d input_db(s) configured',
-            count($this->filesDirs),
-            count($this->inputDbs)
-        ));
-        $this->refreshMarkdown();
-        if ($this->filesDirs !== []) {
-            $this->refreshFiles();
-        }
-        if ($this->inputDbs !== []) {
-            // input_dbs indexing is a planned source — for now log so the user
-            // sees that the config entries are picked up but no rows are pulled.
-            $this->log('input_dbs: configured but indexing-from-dbs is not yet implemented in this version', 'WARN');
-        }
-    }
-
     /**
-     * @return array<string, array{path: string, mtime: int}> keyed by attached-slug
+     * @return array<string, array{path: string, mtime: int}> keyed by source-slug
      */
     private function scanFilesDirs(): array
     {
         $desired = [];
         foreach ($this->filesDirs as $dir) {
             if (!is_dir($dir)) {
-                $this->log('files: dir missing — ' . $dir, 'WARN');
+                $this->log('sources: dir missing — ' . $dir, 'WARN');
                 continue;
             }
             $iter = new RecursiveIteratorIterator(
@@ -647,15 +664,19 @@ final class memhelper
         return $desired;
     }
 
-    private function refreshMarkdown(): void
+    /**
+     * Sync the curated md files under `output/` into the memories FTS5 index.
+     * Idempotent, diff-aware, resumable — identical mechanics to refreshSources
+     * but writes to memories (the searchable layer) instead of state.body.
+     */
+    private function refreshMemoryIndex(): void
     {
         $tStart = microtime(true);
         $orphans = $this->purgeOrphans();
         if ($orphans > 0) {
-            $this->log("markdown: dropped {$orphans} orphan(s) from memories");
+            $this->log("memory-index: dropped {$orphans} orphan(s) from memories");
         }
 
-        // desired = what disk says should be indexed
         $desired = [];
         foreach (glob($this->output . '/*.md') ?: [] as $file) {
             $slug = basename($file, '.md');
@@ -665,14 +686,12 @@ final class memhelper
             $desired[$slug] = ['path' => $file, 'mtime' => (int) filemtime($file)];
         }
 
-        // current = what state table says is indexed
         $rows = $this->db->fetch_all("SELECT slug, mtime, hash FROM memhelper_state WHERE kind = ?", 'memory') ?: [];
         $current = [];
         foreach ($rows as $r) {
             $current[(string) $r['slug']] = ['mtime' => (int) $r['mtime'], 'hash' => (string) $r['hash']];
         }
 
-        // plan
         $toAdd = [];
         $toUpdate = [];
         $toRemove = [];
@@ -694,19 +713,16 @@ final class memhelper
 
         $total = count($toAdd) + count($toUpdate) + count($toRemove);
         if ($total === 0) {
-            $this->log(sprintf('markdown: nothing changed — unchanged=%d (%.2fs)', $unchanged, microtime(true) - $tStart));
+            $this->log(sprintf('memory-index: nothing changed — unchanged=%d (%.2fs)', $unchanged, microtime(true) - $tStart));
             return;
         }
         $this->log(sprintf(
-            'markdown: plan — add=%d update=%d remove=%d unchanged=%d',
+            'memory-index: plan — add=%d update=%d remove=%d unchanged=%d',
             count($toAdd), count($toUpdate), count($toRemove), $unchanged
         ));
 
-        // apply each change as its own write — a crash mid-loop leaves
-        // already-processed slugs persisted, so the next tick picks them up
-        // as unchanged and only processes the remaining diff.
         $done = 0;
-        $tag = 'markdown';
+        $tag = 'memory-index';
 
         foreach ($toRemove as $slug) {
             $this->removeEntry($slug);
@@ -727,8 +743,6 @@ final class memhelper
             [$fm, $body] = self::splitFrontmatter($raw);
             $hash = sha1($body);
             if ($hash === $current[$slug]['hash']) {
-                // mtime changed but content didn't — refresh the state row's
-                // mtime without rewriting the FTS body (expensive on FTS5).
                 $this->db->update(
                     'memhelper_state',
                     ['mtime' => $info['mtime'], 'indexed_at' => time()],
@@ -742,19 +756,34 @@ final class memhelper
             $done++;
             $this->progress($tag, $done, $total, "updated $slug");
         }
-        $this->log(sprintf('markdown: complete in %.2fs', microtime(true) - $tStart));
+        $this->log(sprintf('memory-index: complete in %.2fs', microtime(true) - $tStart));
     }
 
-    private function refreshFiles(): void
+    /**
+     * Walk input_files (and later input_dbs), extract text, and persist each
+     * source into memhelper_state with kind='source' + body. Sources are NOT
+     * inserted into the memories FTS5 index — that one only holds curated
+     * memory entries (output/*.md). When a source's content changes its
+     * distilled_at is cleared so the next distillSources() pass picks it up.
+     */
+    private function refreshSources(): void
     {
+        if ($this->filesDirs === [] && $this->inputDbs === []) {
+            return;
+        }
         $tStart = microtime(true);
+
         $desired = $this->scanFilesDirs();
-        $orphans = $this->purgeOrphans();
-        if ($orphans > 0) {
-            $this->log("files: dropped {$orphans} orphan(s)");
+        // input_dbs are configured but the row walker is not implemented yet —
+        // surface that so the operator knows their entries are parsed but inert.
+        if ($this->inputDbs !== []) {
+            $this->log('input_dbs: configured but db-row indexing is not yet implemented', 'WARN');
         }
 
-        $rows = $this->db->fetch_all("SELECT slug, mtime, hash FROM memhelper_state WHERE kind = ?", 'attached') ?: [];
+        $rows = $this->db->fetch_all(
+            "SELECT slug, mtime, hash FROM memhelper_state WHERE kind = ?",
+            'source'
+        ) ?: [];
         $current = [];
         foreach ($rows as $r) {
             $current[(string) $r['slug']] = ['mtime' => (int) $r['mtime'], 'hash' => (string) $r['hash']];
@@ -781,48 +810,58 @@ final class memhelper
 
         $total = count($toAdd) + count($toUpdate) + count($toRemove);
         if ($total === 0) {
-            $this->log(sprintf('files: nothing changed — unchanged=%d (%.2fs)', $unchanged, microtime(true) - $tStart));
+            $this->log(sprintf('sources: nothing changed — unchanged=%d (%.2fs)', $unchanged, microtime(true) - $tStart));
             return;
         }
         $this->log(sprintf(
-            'files: plan — add=%d update=%d remove=%d unchanged=%d',
+            'sources: plan — add=%d update=%d remove=%d unchanged=%d',
             count($toAdd), count($toUpdate), count($toRemove), $unchanged
         ));
 
         $done = 0;
-        $tag = 'files';
+        $tag = 'sources';
 
         foreach ($toRemove as $slug) {
-            $this->removeEntry($slug);
+            $this->db->delete('memhelper_state', ['slug' => $slug]);
             $done++;
             $this->progress($tag, $done, $total, "removed " . basename((string) self::slugToPath($slug)));
         }
-
         foreach ($toAdd as $slug) {
             $info = $desired[$slug];
             $text = $this->extractText($info['path']);
             if ($text === null) {
-                // unsupported type: remove any stale row + skip
-                $this->removeEntry($slug);
+                $this->markSkipped($slug, $info['mtime']);
                 $done++;
                 $this->progress($tag, $done, $total, "skipped " . basename($info['path']) . " (unsupported)");
                 continue;
             }
-            $this->writeEntry($slug, 'attached', basename($info['path']), $text, $info['mtime']);
+            $this->db->insert('memhelper_state', [
+                'slug' => $slug,
+                'kind' => 'source',
+                'mtime' => $info['mtime'],
+                'hash' => sha1($text),
+                'body' => $text,
+                'indexed_at' => time()
+                // distilled_at intentionally null — distillSources() picks it up
+            ]);
             $done++;
             $this->progress($tag, $done, $total, "added " . basename($info['path']));
         }
-
         foreach ($toUpdate as $slug) {
             $info = $desired[$slug];
             $text = $this->extractText($info['path']);
             if ($text === null) {
-                $this->removeEntry($slug);
+                $this->markSkipped($slug, $info['mtime']);
                 $done++;
-                $this->progress($tag, $done, $total, "dropped " . basename($info['path']) . " (no longer extractable)");
+                $this->progress($tag, $done, $total, "still skipped " . basename($info['path']) . " (unsupported)");
                 continue;
             }
-            if (sha1($text) === $current[$slug]['hash']) {
+            $newHash = sha1($text);
+            if (
+                $current[$slug]['hash'] !== self::SKIPPED_HASH &&
+                $newHash === $current[$slug]['hash']
+            ) {
+                // content unchanged — just bump mtime, leave distilled_at alone
                 $this->db->update(
                     'memhelper_state',
                     ['mtime' => $info['mtime'], 'indexed_at' => time()],
@@ -832,11 +871,121 @@ final class memhelper
                 $this->progress($tag, $done, $total, "touched " . basename($info['path']) . " (mtime-only)");
                 continue;
             }
-            $this->writeEntry($slug, 'attached', basename($info['path']), $text, $info['mtime']);
+            // content changed (or was previously skipped) — clear distilled_at
+            // so distillSources() re-processes this row next.
+            $this->db->delete('memhelper_state', ['slug' => $slug]);
+            $this->db->insert('memhelper_state', [
+                'slug' => $slug,
+                'kind' => 'source',
+                'mtime' => $info['mtime'],
+                'hash' => $newHash,
+                'body' => $text,
+                'indexed_at' => time()
+            ]);
             $done++;
             $this->progress($tag, $done, $total, "updated " . basename($info['path']));
         }
-        $this->log(sprintf('files: complete in %.2fs', microtime(true) - $tStart));
+        $this->log(sprintf('sources: complete in %.2fs', microtime(true) - $tStart));
+    }
+
+    /**
+     * For every source row that has either never been processed or whose
+     * content changed since the last distillation, ask the ai to extract
+     * durable facts and apply the resulting diff to output/*.md.
+     */
+    private function distillSources(): void
+    {
+        if (!$this->aiAvailable()) {
+            // log only when there is actually something pending so we don't
+            // spam the log on every tick of an ai-less deployment.
+            $pending = (int) ($this->db->fetch_var(
+                "SELECT COUNT(*) FROM memhelper_state
+                 WHERE kind = 'source' AND hash != ?
+                   AND (distilled_at IS NULL OR distilled_at < indexed_at)",
+                self::SKIPPED_HASH
+            ) ?: 0);
+            if ($pending > 0) {
+                $this->log("distill: {$pending} source(s) pending but ai is not configured", 'WARN');
+            }
+            return;
+        }
+        $sources = $this->db->fetch_all(
+            "SELECT slug, body FROM memhelper_state
+             WHERE kind = 'source' AND hash != ?
+               AND (distilled_at IS NULL OR distilled_at < indexed_at)
+             ORDER BY indexed_at ASC",
+            self::SKIPPED_HASH
+        ) ?: [];
+        if ($sources === []) {
+            $this->log('distill: no pending sources');
+            return;
+        }
+        $this->log('distill: ' . count($sources) . ' pending source(s)');
+        $tStart = microtime(true);
+        $total = count($sources);
+        foreach ($sources as $i => $row) {
+            $slug = (string) $row['slug'];
+            $body = (string) $row['body'];
+            $idx = $i + 1;
+            $label = (string) (self::slugToPath($slug) ?? $slug);
+            try {
+                $diff = $this->distillOne($label, $body);
+            } catch (\Throwable $e) {
+                $this->log(sprintf('distill: [%d/%d] %s — ai failed: %s', $idx, $total, basename($label), $e->getMessage()), 'WARN');
+                continue;
+            }
+            $counts = ['add' => 0, 'update' => 0, 'delete' => 0, 'skip' => 0];
+            foreach ($diff as $d) {
+                $a = (string) ($d['action'] ?? 'skip');
+                $counts[$a] = ($counts[$a] ?? 0) + 1;
+            }
+            $this->log(sprintf(
+                'distill: [%d/%d] %s — add=%d update=%d delete=%d skip=%d',
+                $idx, $total, basename($label),
+                $counts['add'], $counts['update'], $counts['delete'], $counts['skip']
+            ));
+            $this->applyDiff($diff);
+            // mark as distilled regardless of action count — an empty diff is
+            // a valid answer ("nothing in this source is worth saving") and
+            // shouldn't keep coming back to the ai on every tick.
+            $this->db->update(
+                'memhelper_state',
+                ['distilled_at' => time()],
+                ['slug' => $slug]
+            );
+            $this->progress('distill', $idx, $total, basename($label));
+        }
+        $this->log(sprintf('distill: complete in %.2fs', microtime(true) - $tStart));
+    }
+
+    /**
+     * Single-source distillation — sends body to the ai and returns the
+     * decoded diff array. Encapsulated so distillSources() stays readable.
+     */
+    private function distillOne(string $label, string $body): array
+    {
+        $existing = $this->listMemories();
+        $indexLines = array_map(
+            fn(array $e): string => '- ' . $e['slug'] . ' (' . ($e['type'] ?? 'reference') . '): ' . ($e['description'] ?? ''),
+            $existing
+        );
+        $prompt =
+            "You curate a long-term memory store for an LLM assistant. A source has just been added or updated. Extract any durable facts worth keeping as memory entries.\n\n" .
+            "Source: " . $label . "\n" .
+            "Content:\n" . $body . "\n\n" .
+            "Existing memory entries (slug → description):\n" .
+            ($indexLines === [] ? '(none yet)' : implode("\n", $indexLines)) .
+            "\n\nReturn a JSON array of actions, each with:\n" .
+            "  action: \"add\" | \"update\" | \"skip\"\n" .
+            "  slug: kebab-case (existing for update, new for add)\n" .
+            "  content: full memory body (required for add/update)\n" .
+            "  description: one-line summary (required for add)\n" .
+            "  type: \"user\" | \"feedback\" | \"project\" | \"reference\" (required for add)\n\n" .
+            "A memory entry is a distinct, durable fact — NOT the whole document. Good examples: a person's contact info, a configuration value + its purpose, a decision + its reason, a workflow step. Bad examples: generic how-to content, time-sensitive data, trivia.\n" .
+            "Many sources won't yield anything memorable — return [] in that case.\n" .
+            "Respond with raw JSON only, no markdown fences.";
+        $raw = $this->callAi($prompt);
+        return self::decodeDiff($raw);
     }
 
     // ====================================================================
@@ -1117,6 +1266,8 @@ final class memhelper
         return match ($ext) {
             'md', 'txt', 'csv', 'json', 'yaml', 'yml' => @file_get_contents($path) ?: null,
             'pdf' => self::pdfToText($path),
+            'docx' => self::docxToText($path),
+            'xlsx' => self::xlsxToText($path),
             default => null
         };
     }
@@ -1131,6 +1282,98 @@ final class memhelper
         $code = 0;
         @exec(escapeshellcmd($bin) . ' -layout ' . escapeshellarg($path) . ' - 2>/dev/null', $output, $code);
         return $code === 0 ? implode("\n", $output) : null;
+    }
+
+    /**
+     * Pull plain text out of a .docx — a zip archive holding word/document.xml.
+     * Strip tags + decode entities + collapse whitespace. No external tooling
+     * needed; relies on ext-zip which ships with most PHP builds.
+     */
+    private static function docxToText(string $path): ?string
+    {
+        if (!extension_loaded('zip')) {
+            return null;
+        }
+        $zip = new \ZipArchive();
+        if ($zip->open($path) !== true) {
+            return null;
+        }
+        $xml = $zip->getFromName('word/document.xml');
+        $zip->close();
+        if ($xml === false) {
+            return null;
+        }
+        // <w:p> paragraphs are flattened to a single space so words from
+        // adjacent runs don't collide.
+        $xml = preg_replace('/<\/w:p>/', "\n", $xml) ?? $xml;
+        $text = strip_tags($xml);
+        $text = html_entity_decode($text, ENT_QUOTES | ENT_XML1, 'UTF-8');
+        $text = preg_replace('/[ \t]+/', ' ', $text) ?? $text;
+        $text = preg_replace('/\n{2,}/', "\n\n", $text) ?? $text;
+        return trim($text) ?: null;
+    }
+
+    /**
+     * Pull plain text out of a .xlsx — a zip archive with xl/sharedStrings.xml
+     * and xl/worksheets/sheet*.xml. Numeric / date cells are emitted verbatim,
+     * shared strings are resolved against the lookup table.
+     */
+    private static function xlsxToText(string $path): ?string
+    {
+        if (!extension_loaded('zip')) {
+            return null;
+        }
+        $zip = new \ZipArchive();
+        if ($zip->open($path) !== true) {
+            return null;
+        }
+        try {
+            // shared string table
+            $shared = [];
+            $sharedXml = $zip->getFromName('xl/sharedStrings.xml');
+            if ($sharedXml !== false) {
+                $dom = @simplexml_load_string($sharedXml);
+                if ($dom !== false) {
+                    foreach ($dom->si as $si) {
+                        $buf = '';
+                        foreach ($si->xpath('.//*[local-name()="t"]') ?: [] as $t) {
+                            $buf .= (string) $t;
+                        }
+                        $shared[] = $buf;
+                    }
+                }
+            }
+            // each sheet — values via shared strings, numeric values inline
+            $parts = [];
+            $i = 1;
+            while (true) {
+                $sheetXml = $zip->getFromName("xl/worksheets/sheet{$i}.xml");
+                if ($sheetXml === false) {
+                    break;
+                }
+                $dom = @simplexml_load_string($sheetXml);
+                if ($dom !== false) {
+                    foreach ($dom->sheetData->row as $row) {
+                        foreach ($row->c as $cell) {
+                            $type = (string) $cell['t'];
+                            $val = (string) $cell->v;
+                            if ($type === 's') {
+                                $parts[] = $shared[(int) $val] ?? '';
+                            } elseif ($type === 'inlineStr') {
+                                $parts[] = (string) ($cell->is->t ?? '');
+                            } elseif ($val !== '') {
+                                $parts[] = $val;
+                            }
+                        }
+                    }
+                }
+                $i++;
+            }
+        } finally {
+            $zip->close();
+        }
+        $text = implode(' ', array_filter($parts, fn(string $s): bool => $s !== ''));
+        return $text !== '' ? $text : null;
     }
 
     // ====================================================================
