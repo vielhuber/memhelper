@@ -14,9 +14,9 @@ use vielhuber\dbhelper\dbhelper;
 /**
  * memhelper — markdown-first memory layer for LLM agents.
  *
- * The only public host API is memhelper::enhance($conversation). Everything
- * else — config loading, database connections, queue draining, index
- * refresh, LLM-driven extraction, periodic compaction — runs internally.
+ *   $mem = new memhelper('/path/to/config.yaml');        // yaml path is required
+ *   $prompt = $mem->enhance($conversation) . $prompt;    // host API
+ *   $mem->work();                                        // worker tick
  *
  * Plain `.md` files under `output` stay the source of truth. The configured
  * databases (sqlite, mysql, postgres — any combination, mirrored) hold a
@@ -32,9 +32,13 @@ final class memhelper
     /** @var list<array{driver: string, db: dbhelper}> */
     private array $dbs = [];
 
-    private function __construct()
+    /**
+     * The host must point the constructor at the absolute path of its
+     * memhelper yaml — there is no implicit discovery.
+     */
+    public function __construct(string $configPath)
     {
-        $cfg = self::config();
+        $cfg = self::config($configPath);
 
         $output = (string) ($cfg['output'] ?? '');
         if ($output === '') {
@@ -95,35 +99,17 @@ final class memhelper
         }
     }
 
-    /**
-     * Parse the project config.yaml. Search order:
-     *   1. MEMHELPER_CONFIG env var
-     *   2. ./config.yaml in CWD
-     *   3. ./config.yml
-     */
-    private static function config(): array
+    private static function config(string $configPath): array
     {
-        $env = getenv('MEMHELPER_CONFIG');
-        $candidates = [];
-        if (is_string($env) && $env !== '') {
-            $candidates[] = $env;
+        if ($configPath === '' || !is_file($configPath)) {
+            throw new RuntimeException('memhelper: config yaml not found at "' . $configPath . '"');
         }
-        $cwd = getcwd() ?: '.';
-        $candidates[] = $cwd . '/config.yaml';
-        $candidates[] = $cwd . '/config.yml';
-        foreach ($candidates as $path) {
-            if (is_file($path)) {
-                $parsed = Yaml::parseFile($path);
-                return is_array($parsed) ? $parsed : [];
-            }
-        }
-        throw new RuntimeException(
-            'memhelper: no config.yaml found — point MEMHELPER_CONFIG at one or place config.yaml in CWD'
-        );
+        $parsed = Yaml::parseFile($configPath);
+        return is_array($parsed) ? $parsed : [];
     }
 
     // ====================================================================
-    //  Public — host application entry point (read-only, fast, static)
+    //  Public — host application entry point (read-only, fast)
     // ====================================================================
 
     /**
@@ -133,7 +119,8 @@ final class memhelper
      * facts get extracted in the background; no writes happen on the call's
      * critical path.
      *
-     *   $prompt = memhelper::enhance($conversation) . $prompt;
+     *   $mem = new memhelper('/path/to/config.yaml');
+     *   $prompt = $mem->enhance($conversation) . $prompt;
      *
      * `$conversation` may be any of:
      *   - a plain string (treated as a single user message)
@@ -146,10 +133,16 @@ final class memhelper
      * Unknown shapes degrade gracefully — anything that yields no extractable
      * text is just dropped, never throws.
      */
-    public static function enhance(mixed $conversation): string
+    public function enhance(mixed $conversation): string
     {
         $normalized = self::normalizeConversation($conversation);
-        return (new self())->build($normalized);
+        $query = self::queryFromConversation($normalized);
+        $hits = $query !== '' ? $this->searchAcrossAll($query, 8) : [];
+        $block = $this->composeBlock($hits);
+        if ($normalized !== []) {
+            $this->enqueueConversation($normalized);
+        }
+        return $block;
     }
 
     /**
@@ -247,19 +240,8 @@ final class memhelper
         return '';
     }
 
-    private function build(array $conversation): string
-    {
-        $query = self::queryFromConversation($conversation);
-        $hits = $query !== '' ? $this->searchAcrossAll($query, 8) : [];
-        $block = $this->composeBlock($hits);
-        if ($conversation !== []) {
-            $this->enqueueConversation($conversation);
-        }
-        return $block;
-    }
-
     // ====================================================================
-    //  Internal — supervisor worker entry point (does ALL writes)
+    //  Public — supervisor worker entry point (does ALL writes)
     // ====================================================================
 
     /**
@@ -269,14 +251,13 @@ final class memhelper
      * the once-per-day compaction pass when due. Not part of the host API —
      * application code should call enhance() instead.
      */
-    public static function work(): void
+    public function work(): void
     {
-        $self = new self();
-        $self->processQueue();
-        $self->refreshIndexes();
-        if ($self->shouldCompact()) {
-            $self->compact();
-            $self->markCompacted();
+        $this->processQueue();
+        $this->refreshIndexes();
+        if ($this->shouldCompact()) {
+            $this->compact();
+            $this->markCompacted();
         }
     }
 

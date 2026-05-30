@@ -7,6 +7,7 @@ use vielhuber\memhelper\memhelper;
 final class Test extends TestCase
 {
     private string $tmpDir;
+    private string $cfgPath;
 
     protected function setUp(): void
     {
@@ -15,15 +16,19 @@ final class Test extends TestCase
         $this->writeConfig();
     }
 
+    private function mem(): memhelper
+    {
+        return new memhelper($this->cfgPath);
+    }
+
     protected function tearDown(): void
     {
-        putenv('MEMHELPER_CONFIG=');
         self::removeTree($this->tmpDir);
     }
 
     private function writeConfig(?string $extraFilesDir = null): void
     {
-        $cfgPath = $this->tmpDir . '/config.yaml';
+        $this->cfgPath = $this->tmpDir . '/config.yaml';
         $yaml = "output: " . $this->tmpDir . "\n";
         if ($extraFilesDir !== null) {
             $yaml .= "input_files:\n    - " . $extraFilesDir . "\n";
@@ -31,8 +36,7 @@ final class Test extends TestCase
         $yaml .= "input_dbs:\n" .
                  "    - driver: sqlite\n" .
                  "      path: " . $this->tmpDir . "/.index.sqlite\n";
-        file_put_contents($cfgPath, $yaml);
-        putenv('MEMHELPER_CONFIG=' . $cfgPath);
+        file_put_contents($this->cfgPath, $yaml);
     }
 
     private static function removeTree(string $path): void
@@ -56,8 +60,8 @@ final class Test extends TestCase
 
     public function testEmptyMemoryDirReturnsEmptyString(): void
     {
-        memhelper::work();
-        $this->assertSame('', memhelper::enhance([
+        $this->mem()->work();
+        $this->assertSame('', $this->mem()->enhance([
             ['role' => 'user', 'content' => 'hello']
         ]));
     }
@@ -68,8 +72,8 @@ final class Test extends TestCase
             $this->tmpDir . '/editor-preferences.md',
             "---\nname: editor-preferences\ndescription: editor of choice\nmetadata:\n  type: user\n---\n\nEditor is Helix.\n"
         );
-        memhelper::work();
-        $block = memhelper::enhance([
+        $this->mem()->work();
+        $block = $this->mem()->enhance([
             ['role' => 'user', 'content' => 'what is my editor?']
         ]);
         $this->assertStringContainsString('=== Memory ===', $block);
@@ -83,8 +87,8 @@ final class Test extends TestCase
         mkdir($filesDir);
         file_put_contents($filesDir . '/notes.txt', 'Charly is a multi-agent orchestrator built in php.');
         $this->writeConfig($filesDir);
-        memhelper::work();
-        $block = memhelper::enhance([
+        $this->mem()->work();
+        $block = $this->mem()->enhance([
             ['role' => 'user', 'content' => 'what is the orchestrator about?']
         ]);
         $this->assertStringContainsString('=== Memory ===', $block);
@@ -93,7 +97,7 @@ final class Test extends TestCase
 
     public function testConversationIsEnqueuedForWorker(): void
     {
-        memhelper::enhance([
+        $this->mem()->enhance([
             ['role' => 'user', 'content' => 'i prefer helix as my editor'],
             ['role' => 'assistant', 'content' => 'noted']
         ]);
@@ -109,23 +113,23 @@ final class Test extends TestCase
         // explicit empty array is still legal at the signature level (the
         // caller might pass an empty turn list); enqueueing is the costly
         // side effect, so it must stay gated on non-empty input.
-        memhelper::enhance([]);
+        $this->mem()->enhance([]);
         $this->assertSame([], glob($this->tmpDir . '/.data/queue/*.json') ?: []);
     }
 
     public function testStringConversationIsAccepted(): void
     {
         $this->seedEditorMemory();
-        memhelper::work();
-        $block = memhelper::enhance('what is my editor?');
+        $this->mem()->work();
+        $block = $this->mem()->enhance('what is my editor?');
         $this->assertStringContainsString('Helix', $block);
     }
 
     public function testGeminiPartsShapeIsAccepted(): void
     {
         $this->seedEditorMemory();
-        memhelper::work();
-        $block = memhelper::enhance([
+        $this->mem()->work();
+        $block = $this->mem()->enhance([
             ['role' => 'user', 'parts' => [['text' => 'what is my editor?']]]
         ]);
         $this->assertStringContainsString('Helix', $block);
@@ -134,8 +138,8 @@ final class Test extends TestCase
     public function testAnthropicContentBlocksAreAccepted(): void
     {
         $this->seedEditorMemory();
-        memhelper::work();
-        $block = memhelper::enhance([
+        $this->mem()->work();
+        $block = $this->mem()->enhance([
             ['role' => 'user', 'content' => [
                 ['type' => 'text', 'text' => 'what is my editor?']
             ]]
@@ -146,8 +150,8 @@ final class Test extends TestCase
     public function testListOfStringsIsAccepted(): void
     {
         $this->seedEditorMemory();
-        memhelper::work();
-        $block = memhelper::enhance([
+        $this->mem()->work();
+        $block = $this->mem()->enhance([
             'hi there',
             'hello back',
             'what is my editor?'

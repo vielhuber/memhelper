@@ -51,7 +51,9 @@ input_dbs:
 
 ```php
 use vielhuber\memhelper\memhelper;
-$prompt = memhelper::enhance($conversation).$prompt;
+
+$memory = new memhelper('/path/to/config.yaml');
+$prompt = $memory->enhance($conversation) . $prompt;
 ```
 
 `$conversation` accepts any common shape — OpenAI, Anthropic, Google Gemini, a plain string, a list of strings, or any custom array where each entry carries a `content`, `text` or `message` key. Anything that yields no extractable text is silently dropped.
