@@ -127,19 +127,124 @@ final class memhelper
     // ====================================================================
 
     /**
-     * Append-ready memory block for the host's prompt. Returns the always-
-     * loaded MEMORY.md content (if present) plus the memory entries most
-     * relevant to what is being discussed in the conversation. The conversation
-     * is also written to the worker's queue so any new facts get extracted in
-     * the background; no writes happen on the call's critical path.
+     * Append-ready memory block for the host's prompt. Returns the memory
+     * entries most relevant to what is being discussed in the conversation.
+     * The conversation is also written to the worker's queue so any new
+     * facts get extracted in the background; no writes happen on the call's
+     * critical path.
      *
      *   $prompt = memhelper::enhance($conversation) . $prompt;
      *
-     * @param list<array{role: string, content: string}> $conversation
+     * `$conversation` may be any of:
+     *   - a plain string (treated as a single user message)
+     *   - a list of strings (alternating user / assistant turns)
+     *   - OpenAI / Anthropic shape: `[['role' => 'user'|'assistant'|'system', 'content' => string|array], ...]`
+     *     (content may be a string OR an array of content blocks with `text`)
+     *   - Google Gemini shape: `[['role' => 'user'|'model', 'parts' => [['text' => '...']]], ...]`
+     *   - any custom shape where each entry carries a `content`, `text` or `message` key
+     *
+     * Unknown shapes degrade gracefully — anything that yields no extractable
+     * text is just dropped, never throws.
      */
-    public static function enhance(array $conversation): string
+    public static function enhance(mixed $conversation): string
     {
-        return (new self())->build($conversation);
+        $normalized = self::normalizeConversation($conversation);
+        return (new self())->build($normalized);
+    }
+
+    /**
+     * Reduce any supported conversation shape to a flat list of
+     * `['role' => string, 'content' => string]` entries so the search query
+     * extraction and the worker's extraction prompt can stay simple.
+     */
+    private static function normalizeConversation(mixed $input): array
+    {
+        if (is_string($input)) {
+            return $input === '' ? [] : [['role' => 'user', 'content' => $input]];
+        }
+        if (!is_array($input)) {
+            return [];
+        }
+        $out = [];
+        foreach (array_values($input) as $i => $msg) {
+            if (is_string($msg)) {
+                // bare-string list — assume the host gave us turns in order
+                // starting with the user.
+                $out[] = [
+                    'role' => $i % 2 === 0 ? 'user' : 'assistant',
+                    'content' => $msg
+                ];
+                continue;
+            }
+            if (!is_array($msg)) {
+                continue;
+            }
+            $role = self::normalizeRole((string) ($msg['role'] ?? 'user'));
+            $content = self::extractMessageText($msg);
+            if ($content === '') {
+                continue;
+            }
+            $out[] = ['role' => $role, 'content' => $content];
+        }
+        return $out;
+    }
+
+    private static function normalizeRole(string $role): string
+    {
+        // gemini uses 'model' where openai/anthropic use 'assistant'.
+        return $role === 'model' ? 'assistant' : $role;
+    }
+
+    private static function extractMessageText(array $msg): string
+    {
+        // openai / anthropic: content can be a string OR an array of content
+        // blocks (each potentially `{type, text}` or `{text}`).
+        if (isset($msg['content'])) {
+            $c = $msg['content'];
+            if (is_string($c)) {
+                return $c;
+            }
+            if (is_array($c)) {
+                $parts = [];
+                foreach ($c as $block) {
+                    if (is_string($block)) {
+                        $parts[] = $block;
+                        continue;
+                    }
+                    if (is_array($block)) {
+                        if (isset($block['text']) && is_string($block['text'])) {
+                            $parts[] = $block['text'];
+                        } elseif (isset($block['content']) && is_string($block['content'])) {
+                            $parts[] = $block['content'];
+                        }
+                    }
+                }
+                if ($parts !== []) {
+                    return implode("\n", $parts);
+                }
+            }
+        }
+        // gemini: { role, parts: [ { text }, ... ] }
+        if (isset($msg['parts']) && is_array($msg['parts'])) {
+            $parts = [];
+            foreach ($msg['parts'] as $p) {
+                if (is_string($p)) {
+                    $parts[] = $p;
+                } elseif (is_array($p) && isset($p['text']) && is_string($p['text'])) {
+                    $parts[] = $p['text'];
+                }
+            }
+            if ($parts !== []) {
+                return implode("\n", $parts);
+            }
+        }
+        // legacy / custom fallback keys
+        foreach (['text', 'message', 'body'] as $key) {
+            if (isset($msg[$key]) && is_string($msg[$key])) {
+                return $msg[$key];
+            }
+        }
+        return '';
     }
 
     private function build(array $conversation): string
@@ -179,9 +284,14 @@ final class memhelper
     //  Internal — conversation queue (written by public, drained by tick)
     // ====================================================================
 
+    private function dataDir(): string
+    {
+        return $this->output . '/.data';
+    }
+
     private function queueDir(): string
     {
-        return $this->output . '/.queue';
+        return $this->dataDir() . '/queue';
     }
 
     private function enqueueConversation(array $conversation): void
@@ -234,51 +344,35 @@ final class memhelper
 
     private function composeBlock(array $hits): string
     {
-        $parts = [];
-        $always = $this->readMemoryIndex();
-        if ($always !== '') {
-            $parts[] = trim($always);
-        }
-        if ($hits !== []) {
-            $entries = [];
-            $seen = [];
-            foreach ($hits as $hit) {
-                $slug = (string) ($hit['slug'] ?? '');
-                if ($slug === '' || isset($seen[$slug])) {
-                    continue;
-                }
-                $seen[$slug] = true;
-                $kind = (string) ($hit['kind'] ?? 'memory');
-                if ($kind === 'memory') {
-                    $entry = $this->getMemory($slug);
-                    if ($entry !== null) {
-                        $entries[] = '## ' . $slug . "\n\n" . trim($entry['body']);
-                    }
-                } else {
-                    $path = self::slugToPath($slug);
-                    if ($path !== null) {
-                        $snippet = (string) ($hit['snippet'] ?? '');
-                        $entries[] = '## ' . basename($path) . ' (' . $path . ')' . "\n\n" . trim($snippet);
-                    }
-                }
-            }
-            if ($entries !== []) {
-                $parts[] = "Relevant memory for this conversation:\n\n" . implode("\n\n", $entries);
-            }
-        }
-        if ($parts === []) {
+        if ($hits === []) {
             return '';
         }
-        return "\n\n=== Memory ===\n\n" . implode("\n\n", $parts) . "\n\n=== /Memory ===\n";
-    }
-
-    private function readMemoryIndex(): string
-    {
-        $file = $this->output . '/MEMORY.md';
-        if (!is_file($file)) {
+        $entries = [];
+        $seen = [];
+        foreach ($hits as $hit) {
+            $slug = (string) ($hit['slug'] ?? '');
+            if ($slug === '' || isset($seen[$slug])) {
+                continue;
+            }
+            $seen[$slug] = true;
+            $kind = (string) ($hit['kind'] ?? 'memory');
+            if ($kind === 'memory') {
+                $entry = $this->getMemory($slug);
+                if ($entry !== null) {
+                    $entries[] = '## ' . $slug . "\n\n" . trim($entry['body']);
+                }
+            } else {
+                $path = self::slugToPath($slug);
+                if ($path !== null) {
+                    $snippet = (string) ($hit['snippet'] ?? '');
+                    $entries[] = '## ' . basename($path) . ' (' . $path . ')' . "\n\n" . trim($snippet);
+                }
+            }
+        }
+        if ($entries === []) {
             return '';
         }
-        return (string) file_get_contents($file);
+        return "\n\n=== Memory ===\n\n" . implode("\n\n", $entries) . "\n\n=== /Memory ===\n";
     }
 
     private static function queryFromConversation(array $conversation): string
@@ -516,13 +610,18 @@ final class memhelper
         // memory dir is small enough that a full rebuild is single-digit ms.
         $db->delete('memories', ['kind' => 'memory']);
         foreach (glob($this->output . '/*.md') ?: [] as $file) {
-            if (basename($file) === 'MEMORY.md') {
+            $slug = basename($file, '.md');
+            // skip files whose name is not a valid slug — the rest of the
+            // pipeline assumes assertValidSlug() succeeds when retrieving a
+            // hit, so putting non-conforming names into the index would
+            // crash composeBlock() later.
+            if (!self::isValidSlug($slug)) {
                 continue;
             }
             $raw = (string) file_get_contents($file);
             [$fm, $body] = self::splitFrontmatter($raw);
             $db->insert('memories', [
-                'slug' => basename($file, '.md'),
+                'slug' => $slug,
                 'kind' => 'memory',
                 'title' => (string) ($fm['description'] ?? ''),
                 'body' => $body
@@ -628,9 +727,6 @@ final class memhelper
         }
         $blocks = [];
         foreach (glob($this->output . '/*.md') ?: [] as $file) {
-            if (basename($file) === 'MEMORY.md') {
-                continue;
-            }
             $raw = (string) file_get_contents($file);
             [$fm, $body] = self::splitFrontmatter($raw);
             $blocks[] =
@@ -657,7 +753,7 @@ final class memhelper
 
     private function shouldCompact(): bool
     {
-        $sentinel = $this->output . '/.last_compact';
+        $sentinel = $this->dataDir() . '/last_compact';
         if (!is_file($sentinel)) {
             return true;
         }
@@ -667,12 +763,16 @@ final class memhelper
 
     private function markCompacted(): void
     {
-        @file_put_contents($this->output . '/.last_compact', (string) time());
+        $dataDir = $this->dataDir();
+        if (!is_dir($dataDir) && !@mkdir($dataDir, 0775, true)) {
+            return;
+        }
+        @file_put_contents($dataDir . '/last_compact', (string) time());
     }
 
     private function backup(): void
     {
-        $dir = $this->output . '/.backup/' . date('Ymd-His');
+        $dir = $this->dataDir() . '/backup/' . date('Ymd-His');
         if (!@mkdir($dir, 0775, true) && !is_dir($dir)) {
             return;
         }
@@ -758,9 +858,6 @@ final class memhelper
     {
         $out = [];
         foreach (glob($this->output . '/*.md') ?: [] as $file) {
-            if (basename($file) === 'MEMORY.md') {
-                continue;
-            }
             $head = (string) file_get_contents($file, false, null, 0, 4096);
             [$fm] = self::splitFrontmatter($head);
             $entryType = $fm['metadata']['type'] ?? null;
@@ -861,9 +958,14 @@ final class memhelper
 
     private static function assertValidSlug(string $slug): void
     {
-        if (!preg_match('/^[a-z0-9][a-z0-9_-]{0,127}$/', $slug)) {
+        if (!self::isValidSlug($slug)) {
             throw new RuntimeException('memhelper: invalid slug "' . $slug . '" — use kebab/snake_case ASCII');
         }
+    }
+
+    private static function isValidSlug(string $slug): bool
+    {
+        return preg_match('/^[a-z0-9][a-z0-9_-]{0,127}$/', $slug) === 1;
     }
 
     private static function pathToSlug(string $path): string

@@ -25,12 +25,12 @@ ai:
 output: /path/to/memory
 
 input_files:
-    - /path/to/memory/attached
-    - /path/to/extra/docs
+    - /path/to/external/docs
+    - /path/to/external/notes
 
 input_dbs:
     - driver: sqlite
-      path: /path/to/memhelper.db
+      path: /path/to/database.db
 
     - driver: mysql
       host: 127.0.0.1
@@ -42,9 +42,9 @@ input_dbs:
     - driver: postgres
       host: 127.0.0.1
       port: 5432
-      user: postgres
+      user: root
       password:
-      database: memhelper
+      database: database
 ```
 
 ## usage
@@ -54,11 +54,13 @@ use vielhuber\memhelper\memhelper;
 $prompt = memhelper::enhance($conversation).$prompt;
 ```
 
+`$conversation` accepts any common shape — OpenAI, Anthropic, Google Gemini, a plain string, a list of strings, or any custom array where each entry carries a `content`, `text` or `message` key. Anything that yields no extractable text is silently dropped.
+
 ## worker
 
 ```ini
 [program:memhelper-worker]
-command=php /app/vendor/vielhuber/memhelper/bin/memhelper-worker 30
+command=php /app/vendor/vielhuber/memhelper/bin/memhelper-worker
 autostart=true
 autorestart=true
 ```

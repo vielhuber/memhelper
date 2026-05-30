@@ -6,23 +6,23 @@ ai:
 output: /path/to/memory
 
 input_files:
-    - /path/to/memory/attached
-    - /path/to/extra/docs
+    - /path/to/external/docs
+    - /path/to/external/notes
 
 input_dbs:
     - driver: sqlite
-      path: /path/to/memhelper.db
+      path: /path/to/database.db
 
     - driver: mysql
       host: 127.0.0.1
       port: 3306
       user: root
       password:
-      database: memhelper
+      database: database
 
     - driver: postgres
       host: 127.0.0.1
       port: 5432
-      user: postgres
+      user: root
       password:
-      database: memhelper
+      database: database

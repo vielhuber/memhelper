@@ -18,10 +18,7 @@ foreach (
 
 use vielhuber\memhelper\memhelper;
 
-// supervisord typically passes the polling interval as the first arg; fall
-// back to 30 s when no value is given. clamp to >=1 s so a misconfiguration
-// can't tight-loop the box.
-$interval = max(1, (int) ($argv[1] ?? 30));
+const INTERVAL_SECONDS = 30;
 
 if (function_exists('pcntl_async_signals')) {
     pcntl_async_signals(true);
@@ -29,7 +26,7 @@ if (function_exists('pcntl_async_signals')) {
     pcntl_signal(SIGINT, static fn(): never => exit(0));
 }
 
-fwrite(STDOUT, '[' . date('c') . '] memhelper-worker starting (interval=' . $interval . 's)' . PHP_EOL);
+fwrite(STDOUT, '[' . date('c') . '] memhelper-worker starting (interval=' . INTERVAL_SECONDS . 's)' . PHP_EOL);
 
 while (true) {
     try {
@@ -37,5 +34,5 @@ while (true) {
     } catch (\Throwable $e) {
         fwrite(STDERR, '[' . date('c') . '] error: ' . $e->getMessage() . PHP_EOL);
     }
-    sleep($interval);
+    sleep(INTERVAL_SECONDS);
 }

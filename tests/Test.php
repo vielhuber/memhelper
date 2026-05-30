@@ -62,20 +62,6 @@ final class Test extends TestCase
         ]));
     }
 
-    public function testMemoryMdIsAlwaysIncludedForAnyConversation(): void
-    {
-        file_put_contents(
-            $this->tmpDir . '/MEMORY.md',
-            "# Memory\n\n- the user is David\n"
-        );
-        memhelper::work();
-        $block = memhelper::enhance([
-            ['role' => 'user', 'content' => 'something unrelated to the index']
-        ]);
-        $this->assertStringContainsString('=== Memory ===', $block);
-        $this->assertStringContainsString('the user is David', $block);
-    }
-
     public function testRelevantMemoryIsRetrievedForMatchingTopic(): void
     {
         file_put_contents(
@@ -111,7 +97,7 @@ final class Test extends TestCase
             ['role' => 'user', 'content' => 'i prefer helix as my editor'],
             ['role' => 'assistant', 'content' => 'noted']
         ]);
-        $queued = glob($this->tmpDir . '/.queue/*.json') ?: [];
+        $queued = glob($this->tmpDir . '/.data/queue/*.json') ?: [];
         $this->assertCount(1, $queued);
         $decoded = json_decode((string) file_get_contents($queued[0]), true);
         $this->assertIsArray($decoded);
@@ -124,6 +110,56 @@ final class Test extends TestCase
         // caller might pass an empty turn list); enqueueing is the costly
         // side effect, so it must stay gated on non-empty input.
         memhelper::enhance([]);
-        $this->assertSame([], glob($this->tmpDir . '/.queue/*.json') ?: []);
+        $this->assertSame([], glob($this->tmpDir . '/.data/queue/*.json') ?: []);
+    }
+
+    public function testStringConversationIsAccepted(): void
+    {
+        $this->seedEditorMemory();
+        memhelper::work();
+        $block = memhelper::enhance('what is my editor?');
+        $this->assertStringContainsString('Helix', $block);
+    }
+
+    public function testGeminiPartsShapeIsAccepted(): void
+    {
+        $this->seedEditorMemory();
+        memhelper::work();
+        $block = memhelper::enhance([
+            ['role' => 'user', 'parts' => [['text' => 'what is my editor?']]]
+        ]);
+        $this->assertStringContainsString('Helix', $block);
+    }
+
+    public function testAnthropicContentBlocksAreAccepted(): void
+    {
+        $this->seedEditorMemory();
+        memhelper::work();
+        $block = memhelper::enhance([
+            ['role' => 'user', 'content' => [
+                ['type' => 'text', 'text' => 'what is my editor?']
+            ]]
+        ]);
+        $this->assertStringContainsString('Helix', $block);
+    }
+
+    public function testListOfStringsIsAccepted(): void
+    {
+        $this->seedEditorMemory();
+        memhelper::work();
+        $block = memhelper::enhance([
+            'hi there',
+            'hello back',
+            'what is my editor?'
+        ]);
+        $this->assertStringContainsString('Helix', $block);
+    }
+
+    private function seedEditorMemory(): void
+    {
+        file_put_contents(
+            $this->tmpDir . '/editor-preferences.md',
+            "---\nname: editor-preferences\ndescription: editor of choice\nmetadata:\n  type: user\n---\n\nEditor is Helix.\n"
+        );
     }
 }
