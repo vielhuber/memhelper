@@ -1771,18 +1771,35 @@ final class memhelper
             "  - description: a one-line summary\n" .
             "  - type: one of \"user\", \"feedback\", \"project\", \"reference\"\n\n" .
             "RULES:\n" .
-            "  1. Extract EVERY concrete fact about people, things, preferences, projects, decisions, configurations. Be generous.\n" .
-            "  2. One fact = one entry. Split combined statements into separate entries.\n" .
-            "  3. If the source mentions a fact that overlaps an existing slug → use action:\"update\" with the merged content.\n" .
-            "  4. Only return [] if the source is genuinely generic (a tutorial, raw transcript, news article with no personal/project content).\n" .
-            "  5. Write `content` and `description` in the LANGUAGE OF THE SOURCE. If the source mixes languages, use the dominant one. This keeps memory searchable in the user's own words.\n" .
-            "  6. When a fact references another existing slug from the list above (a person, project, thing already curated), inline that reference in `content` as `[[that-slug]]`. These cross-references are followed at retrieval time so neighbours surface together.\n\n" .
-            "WORKED EXAMPLE (do NOT copy these into your output — they are illustrations only):\n" .
+            "  1. CROSS-LINK AGGRESSIVELY. Whenever an entry mentions an entity (person, project, account, household, contract, recurring concept), inline a `[[that-slug]]` reference to it. This applies BOTH to slugs already in the list above AND to slugs you are creating in THIS SAME response — list newly-added slugs first, then reference them from later entries. Cross-references are how related memories surface together at retrieval time. An entry without any `[[…]]` is almost always a missed opportunity unless the fact is genuinely standalone.\n" .
+            "  2. When several entries share a recurring umbrella concept (e.g. \"household budget\", \"family\", \"vehicle fleet\", a specific contract suite), add ONE hub entry for the umbrella and link every related entry from it as `[[hub-slug]]` references inside the hub's content.\n" .
+            "  3. Extract EVERY concrete fact about people, things, preferences, projects, decisions, configurations. Be generous.\n" .
+            "  4. One fact = one entry. Split combined statements into separate entries.\n" .
+            "  5. If the source mentions a fact that overlaps an existing slug → use action:\"update\" with the merged content.\n" .
+            "  6. Only return [] if the source is genuinely generic (a tutorial, raw transcript, news article with no personal/project content).\n" .
+            "  7. Write `content` and `description` in the LANGUAGE OF THE SOURCE. If the source mixes languages, use the dominant one. This keeps memory searchable in the user's own words.\n\n" .
+            "WORKED EXAMPLE A — linking to a PRE-EXISTING slug (do NOT copy these into your output — they are illustrations only):\n" .
             "  Source content: \"Meine Katze heißt Mochi und ich nutze vim als Editor. Mochi mag meine Schwester Anna.\"\n" .
             "  Existing slugs include: contact-anna\n" .
             "  Output: [\n" .
             "    {\"action\":\"add\",\"slug\":\"pet-mochi\",\"content\":\"Die Katze des Users heißt Mochi. Mochi mag [[contact-anna]].\",\"description\":\"die Katze des Users\",\"type\":\"user\"},\n" .
             "    {\"action\":\"add\",\"slug\":\"editor-preference\",\"content\":\"Der User bevorzugt vim als Editor.\",\"description\":\"Editor-Präferenz\",\"type\":\"user\"}\n" .
+            "  ]\n\n" .
+            "WORKED EXAMPLE B — linking to slugs ADDED IN THE SAME BATCH + a HUB entry:\n" .
+            "  Source content: \"Lorenz und Rosalie sind meine Kinder. Lorenz spielt Fußball, Rosalie geht zur Ballettstunde.\"\n" .
+            "  Existing slugs include: (none relevant)\n" .
+            "  Output: [\n" .
+            "    {\"action\":\"add\",\"slug\":\"contact-lorenz\",\"content\":\"Lorenz ist Sohn des Users. Lorenz spielt Fußball.\",\"description\":\"Sohn des Users\",\"type\":\"user\"},\n" .
+            "    {\"action\":\"add\",\"slug\":\"contact-rosalie\",\"content\":\"Rosalie ist Tochter des Users. Rosalie geht zur Ballettstunde.\",\"description\":\"Tochter des Users\",\"type\":\"user\"},\n" .
+            "    {\"action\":\"add\",\"slug\":\"children-of-user\",\"content\":\"Die Kinder des Users sind [[contact-lorenz]] und [[contact-rosalie]].\",\"description\":\"die Kinder des Users\",\"type\":\"user\"}\n" .
+            "  ]\n\n" .
+            "WORKED EXAMPLE C — recurring umbrella across many entries (the haushaltsbuch pattern):\n" .
+            "  Source content: \"Im Haushaltsbuch: All-Inkl 177€/Jahr, Vodafone GigaZuhause 64,99€/Monat, HelloFresh 165,96€/Monat.\"\n" .
+            "  Output: [\n" .
+            "    {\"action\":\"add\",\"slug\":\"hosting-all-inkl\",\"content\":\"Der User nutzt All-Inkl. Im [[household-budget]] sind 177€ jährlich angesetzt.\",\"description\":\"...\",\"type\":\"user\"},\n" .
+            "    {\"action\":\"add\",\"slug\":\"internet-vodafone\",\"content\":\"Der User nutzt Vodafone GigaZuhause. Im [[household-budget]] sind 64,99€ monatlich angesetzt.\",\"description\":\"...\",\"type\":\"user\"},\n" .
+            "    {\"action\":\"add\",\"slug\":\"food-hellofresh\",\"content\":\"Der User nutzt HelloFresh. Im [[household-budget]] sind 165,96€ monatlich angesetzt.\",\"description\":\"...\",\"type\":\"user\"},\n" .
+            "    {\"action\":\"add\",\"slug\":\"household-budget\",\"content\":\"Das Haushaltsbuch des Users umfasst u.a. [[hosting-all-inkl]], [[internet-vodafone]], [[food-hellofresh]].\",\"description\":\"Haushaltsbuch-Übersicht\",\"type\":\"project\"}\n" .
             "  ]\n\n" .
             "NOW process the source above and return the JSON array.";
         $raw = $this->callAi($prompt);
@@ -1823,7 +1840,7 @@ final class memhelper
             "  description: one-line summary (required for add)\n" .
             "  type: \"user\" | \"feedback\" | \"project\" | \"reference\" (required for add)\n\n" .
             "Write `content` and `description` in the LANGUAGE OF THE CONVERSATION so retrieval matches the user's own phrasing.\n" .
-            "When a fact references an existing slug from the list above (a person, project, thing already curated), inline that reference in `content` as `[[that-slug]]` — these links are followed at retrieval time so related entries surface together.\n\n" .
+            "CROSS-LINK AGGRESSIVELY: whenever a fact references an entity (person, project, account, recurring concept), inline `[[that-slug]]`. This applies BOTH to slugs from the list above AND to slugs you are adding in this same response — entries you add can reference each other. An umbrella concept that ties several entries together should get its own hub entry with `[[…]]` links to each member. An entry without any `[[…]]` is almost always a missed opportunity unless the fact is genuinely standalone.\n\n" .
             "Only include changes worth keeping. Return [] if nothing is worth saving. Respond with raw JSON, no markdown fences.";
         $this->log(sprintf('extract: calling ai (%s/%s) with prompt of %d bytes', $this->aiConfig['provider'] ?? '?', $this->aiConfig['model'] ?? '?', strlen($prompt)));
         $tStart = microtime(true);
@@ -1866,7 +1883,11 @@ final class memhelper
         }
         $this->log(sprintf('compact: evaluating %d memory entries', count($blocks)));
         $prompt =
-            "You curate a long-term memory store for an LLM assistant. The current entries are listed below. Identify duplicates, contradictions, and obsolete facts. Merge overlapping entries into a single canonical entry. Drop anything that is no longer relevant. Preserve the original language of each entry and the `[[slug]]` cross-references inside bodies — those links power 1-hop expansion at retrieval time, so when merging entries, carry every link forward into the canonical entry.\n\n" .
+            "You curate a long-term memory store for an LLM assistant. The current entries are listed below. Do four things:\n" .
+            "  1. DEDUPE + MERGE: identify duplicates, contradictions, obsolete facts — collapse overlapping entries into one canonical entry, drop anything no longer relevant.\n" .
+            "  2. ADD MISSING CROSS-REFERENCES: most entries below were created without `[[slug]]` links. Walk through them and, whenever an entry mentions an entity that already has its own slug (a person, project, contract, recurring concept, an umbrella like \"household budget\"), emit an `update` action whose `content` is the original body with `[[that-slug]]` inserted at the right places. If many entries clearly share an umbrella concept but no hub entry exists yet, ADD one and link all members to it (e.g. `household-budget` hub linking every recurring expense entry).\n" .
+            "  3. PRESERVE every existing `[[slug]]` cross-reference when rewriting bodies — those links power 1-hop expansion at retrieval time.\n" .
+            "  4. PRESERVE the original language of each entry — never translate.\n\n" .
             implode("\n\n---\n\n", $blocks) .
             "\n\nReturn a JSON array of actions using the same schema as the extract step (action, slug, content, description, type). Respond with raw JSON only, no markdown fences.";
         $tStart = microtime(true);
