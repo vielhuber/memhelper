@@ -72,7 +72,7 @@ final class Test extends TestCase
         $block = memhelper::enhance([
             ['role' => 'user', 'content' => 'what is my editor?']
         ]);
-        $this->assertStringContainsString('Relevant memory for this conversation', $block);
+        $this->assertStringContainsString('=== Memory ===', $block);
         $this->assertStringContainsString('editor-preferences', $block);
         $this->assertStringContainsString('Helix', $block);
     }
@@ -87,7 +87,7 @@ final class Test extends TestCase
         $block = memhelper::enhance([
             ['role' => 'user', 'content' => 'what is the orchestrator about?']
         ]);
-        $this->assertStringContainsString('Relevant memory', $block);
+        $this->assertStringContainsString('=== Memory ===', $block);
         $this->assertStringContainsString('notes.txt', $block);
     }
 
