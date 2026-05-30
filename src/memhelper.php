@@ -947,7 +947,7 @@ final class memhelper
             $idx = $i + 1;
             $label = (string) (self::slugToPath($slug) ?? $slug);
             try {
-                $diff = $this->distillOne($label, $body);
+                [$diff, $raw] = $this->distillOne($label, $body);
             } catch (\Throwable $e) {
                 $this->log(sprintf('distill: [%d/%d] %s — ai failed: %s', $idx, $total, basename($label), $e->getMessage()), 'WARN');
                 continue;
@@ -958,10 +958,18 @@ final class memhelper
                 $counts[$a] = ($counts[$a] ?? 0) + 1;
             }
             $this->log(sprintf(
-                'distill: [%d/%d] %s — add=%d update=%d delete=%d skip=%d',
+                'distill: [%d/%d] %s — add=%d update=%d delete=%d skip=%d (%d bytes raw)',
                 $idx, $total, basename($label),
-                $counts['add'], $counts['update'], $counts['delete'], $counts['skip']
+                $counts['add'], $counts['update'], $counts['delete'], $counts['skip'],
+                strlen($raw)
             ));
+            // when the ai produced no actions, dump the raw response so the
+            // operator can tell whether it was an empty array, prose, or
+            // something json-decode couldn't grok.
+            if ($counts['add'] + $counts['update'] + $counts['delete'] === 0) {
+                $preview = strlen($raw) > 500 ? substr($raw, 0, 500) . '… (truncated)' : $raw;
+                $this->log('distill: raw ai response was: ' . str_replace(["\r", "\n"], ['', ' ⏎ '], $preview), 'WARN');
+            }
             $this->applyDiff($diff);
             // mark as distilled regardless of action count — an empty diff is
             // a valid answer ("nothing in this source is worth saving") and
@@ -977,8 +985,11 @@ final class memhelper
     }
 
     /**
-     * Single-source distillation — sends body to the ai and returns the
-     * decoded diff array. Encapsulated so distillSources() stays readable.
+     * Single-source distillation — sends body to the ai and returns a tuple
+     * of the decoded diff array AND the raw ai response (for diagnostic
+     * logging by the caller). Encapsulated so distillSources stays readable.
+     *
+     * @return array{0: list<array<string, mixed>>, 1: string}
      */
     private function distillOne(string $label, string $body): array
     {
@@ -988,29 +999,34 @@ final class memhelper
             $existing
         );
         $prompt =
-            "You curate a long-term memory store for an LLM assistant. A new source document has been added or updated. Extract every personal or project-specific fact worth remembering as a memory entry. Be GENEROUS — anything that personalises future assistance is valuable.\n\n" .
+            "TASK: Extract durable facts from the source document below into a memory store.\n\n" .
             "Source: " . $label . "\n" .
-            "Content:\n" . $body . "\n\n" .
-            "Existing memory entries (slug → description):\n" .
+            "---BEGIN SOURCE---\n" .
+            $body . "\n" .
+            "---END SOURCE---\n\n" .
+            "Existing memory slugs:\n" .
             ($indexLines === [] ? '(none yet)' : implode("\n", $indexLines)) .
-            "\n\nReturn a JSON array of actions, each with:\n" .
-            "  action: \"add\" | \"update\" | \"skip\"\n" .
-            "  slug: kebab-case (existing for update, new for add)\n" .
-            "  content: full memory body (required for add/update) — written in third person\n" .
-            "  description: one-line summary (required for add)\n" .
-            "  type: \"user\" | \"feedback\" | \"project\" | \"reference\" (required for add)\n\n" .
-            "Examples of what to EXTRACT:\n" .
-            "  - \"Mein Hund heißt Roger\" → {action:add, slug:\"pet-roger\", content:\"The user's dog is named Roger.\", description:\"the user's dog\", type:\"user\"}\n" .
-            "  - \"Ich heiße David, lebe in Berlin\" → {action:add, slug:\"user-profile\", content:\"The user is David, based in Berlin.\", description:\"who the user is\", type:\"user\"}\n" .
-            "  - \"Ich bevorzuge Helix als Editor\" → {action:add, slug:\"editor-preferences\", content:\"User prefers Helix.\", description:\"editor of choice\", type:\"user\"}\n" .
-            "  - \"Projekt Charly nutzt PHP 8.5\" → {action:add, slug:\"charly-stack\", content:\"Charly runs on PHP 8.5.\", description:\"charly tech stack\", type:\"project\"}\n" .
-            "  - \"Meine Kollegin Anna ist für Rechnungen zuständig\" → {action:add, slug:\"colleague-anna\", content:\"Anna handles billing.\", description:\"colleague responsibilities\", type:\"user\"}\n\n" .
-            "Granularity rule: ONE distinct fact per entry. \"David has a dog named Roger\" and \"David lives in Berlin\" become TWO separate entries (pet-roger, user-profile), not one merged entry.\n\n" .
-            "If a fact extends or contradicts an existing entry, return \"update\" with the merged content instead of duplicating.\n\n" .
-            "Only return \"skip\" / an empty array when the source contains nothing personal or project-specific (e.g. a how-to article, raw transcripts without facts, time-sensitive news). Spreadsheets, contact lists, notes, contracts, and personal docs almost ALWAYS yield at least one entry.\n\n" .
-            "Respond with raw JSON only, no markdown fences, no commentary.";
+            "\n\n" .
+            "OUTPUT: Reply with a JSON array — nothing before or after, no markdown fences. Each item has:\n" .
+            "  - action: \"add\" or \"update\"\n" .
+            "  - slug: kebab-case identifier (new slug for add, existing slug for update)\n" .
+            "  - content: the memory body, written in third person\n" .
+            "  - description: a one-line summary\n" .
+            "  - type: one of \"user\", \"feedback\", \"project\", \"reference\"\n\n" .
+            "RULES:\n" .
+            "  1. Extract EVERY concrete fact about people, things, preferences, projects, decisions, configurations. Be generous.\n" .
+            "  2. One fact = one entry. Split combined statements into separate entries.\n" .
+            "  3. If the source mentions a fact that overlaps an existing slug → use action:\"update\" with the merged content.\n" .
+            "  4. Only return [] if the source is genuinely generic (a tutorial, raw transcript, news article with no personal/project content).\n\n" .
+            "WORKED EXAMPLE (do NOT copy these into your output — they are illustrations only):\n" .
+            "  Source content: \"Meine Katze heißt Mochi und ich nutze vim als Editor.\"\n" .
+            "  Output: [\n" .
+            "    {\"action\":\"add\",\"slug\":\"pet-mochi\",\"content\":\"The user has a cat named Mochi.\",\"description\":\"the user's cat\",\"type\":\"user\"},\n" .
+            "    {\"action\":\"add\",\"slug\":\"editor-preference\",\"content\":\"The user prefers vim as their editor.\",\"description\":\"editor of choice\",\"type\":\"user\"}\n" .
+            "  ]\n\n" .
+            "NOW process the source above and return the JSON array.";
         $raw = $this->callAi($prompt);
-        return self::decodeDiff($raw);
+        return [self::decodeDiff($raw), $raw];
     }
 
     // ====================================================================
@@ -1268,17 +1284,40 @@ final class memhelper
     private static function decodeDiff(string $raw): array
     {
         $raw = trim($raw);
-        if (str_starts_with($raw, '```')) {
-            $raw = (string) preg_replace('/^```(?:json)?\r?\n|\r?\n```$/m', '', $raw);
+        // strip markdown fences (```json … ``` or ``` … ```) — handle both
+        // start-only and start+end fences anywhere in the response.
+        if (str_contains($raw, '```')) {
+            $raw = (string) preg_replace('/```(?:json)?\r?\n?/', '', $raw);
             $raw = trim($raw);
         }
+        // first try: outer-most json array
         $start = strpos($raw, '[');
         $end = strrpos($raw, ']');
-        if ($start === false || $end === false || $end <= $start) {
-            return [];
+        if ($start !== false && $end !== false && $end > $start) {
+            $decoded = json_decode(substr($raw, $start, $end - $start + 1), true);
+            if (is_array($decoded)) {
+                return $decoded;
+            }
         }
-        $decoded = json_decode(substr($raw, $start, $end - $start + 1), true);
-        return is_array($decoded) ? $decoded : [];
+        // second try: outer-most json object — some providers wrap the array
+        // in {"actions": [...]}, {"diff": [...]} or {"facts": [...]}.
+        $start = strpos($raw, '{');
+        $end = strrpos($raw, '}');
+        if ($start !== false && $end !== false && $end > $start) {
+            $decoded = json_decode(substr($raw, $start, $end - $start + 1), true);
+            if (is_array($decoded)) {
+                foreach (['actions', 'diff', 'facts', 'entries', 'memories', 'items'] as $key) {
+                    if (isset($decoded[$key]) && is_array($decoded[$key])) {
+                        return $decoded[$key];
+                    }
+                }
+                // bare object with action keys → treat as single action
+                if (isset($decoded['action']) || isset($decoded['slug'])) {
+                    return [$decoded];
+                }
+            }
+        }
+        return [];
     }
 
     // ====================================================================
