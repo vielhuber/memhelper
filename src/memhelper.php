@@ -487,21 +487,72 @@ final class memhelper
         // distillation and surface as curated md entries here.
         $entries = [];
         $seen = [];
+        $primarySlugs = [];
         foreach ($hits as $hit) {
             $slug = (string) ($hit['slug'] ?? '');
             if ($slug === '' || isset($seen[$slug])) {
                 continue;
             }
             $seen[$slug] = true;
+            $primarySlugs[] = $slug;
             $entry = $this->getMemory($slug);
             if ($entry !== null) {
                 $entries[] = '## ' . $slug . "\n\n" . trim($entry['body']);
+            }
+        }
+        // 1-hop expansion via [[…]] links — pull in neighbours of every hit
+        // (both outgoing and incoming) so the model sees facts that the user's
+        // query didn't lexically match but that the curator marked as related.
+        foreach ($this->neighboursOf($primarySlugs, count($primarySlugs)) as $slug) {
+            if (isset($seen[$slug])) {
+                continue;
+            }
+            $seen[$slug] = true;
+            $entry = $this->getMemory($slug);
+            if ($entry !== null) {
+                $entries[] = '## ' . $slug . " (via [[…]] link)\n\n" . trim($entry['body']);
             }
         }
         if ($entries === []) {
             return '';
         }
         return "\n\n=== Memory ===\n\n" . implode("\n\n", $entries) . "\n\n=== /Memory ===\n";
+    }
+
+    /**
+     * Return up to `$maxAdd` slugs reachable from any of `$primarySlugs` via
+     * one hop in the link graph (either direction). The cap keeps the prompt
+     * bounded when an entry is heavily cross-referenced.
+     */
+    private function neighboursOf(array $primarySlugs, int $maxAdd): array
+    {
+        if ($primarySlugs === [] || $maxAdd <= 0) {
+            return [];
+        }
+        $placeholders = implode(',', array_fill(0, count($primarySlugs), '?'));
+        try {
+            $rows = $this->db->fetch_all(
+                "SELECT to_slug AS slug FROM memhelper_links WHERE from_slug IN ($placeholders)
+                 UNION
+                 SELECT from_slug AS slug FROM memhelper_links WHERE to_slug IN ($placeholders)",
+                ...array_merge($primarySlugs, $primarySlugs)
+            ) ?: [];
+        } catch (\Throwable) {
+            return [];
+        }
+        $primary = array_flip($primarySlugs);
+        $out = [];
+        foreach ($rows as $r) {
+            $s = (string) ($r['slug'] ?? '');
+            if ($s === '' || isset($primary[$s])) {
+                continue;
+            }
+            $out[$s] = true;
+            if (count($out) >= $maxAdd) {
+                break;
+            }
+        }
+        return array_keys($out);
     }
 
     private static function queryFromConversation(array $conversation): string
@@ -595,6 +646,7 @@ final class memhelper
             $db->query('DROP TABLE IF EXISTS memories');
             $db->query('DROP TABLE IF EXISTS memhelper_meta');
             $db->query('DROP TABLE IF EXISTS memhelper_state');
+            $db->query('DROP TABLE IF EXISTS memhelper_links');
         }
         // memories: ONLY curated md entries (kind='memory'). sources never
         // land here — they are read by the ai during distillation, then the
@@ -631,6 +683,19 @@ final class memhelper
                 updated_at INTEGER NOT NULL
             )'
         );
+        // memhelper_links: explicit cross-references between memory entries,
+        // materialised from `[[slug]]` patterns in their bodies. enables a
+        // 1-hop expansion at search time so a hit on one entry surfaces its
+        // neighbours too. one row per directed edge — duplicates collapse
+        // via the composite primary key.
+        $db->query(
+            'CREATE TABLE IF NOT EXISTS memhelper_links (
+                from_slug TEXT NOT NULL,
+                to_slug TEXT NOT NULL,
+                PRIMARY KEY (from_slug, to_slug)
+            )'
+        );
+        $db->query('CREATE INDEX IF NOT EXISTS memhelper_links_to ON memhelper_links(to_slug)');
     }
 
     private function writeEntry(string $slug, string $kind, string $title, string $body, int $mtime): void
@@ -650,12 +715,51 @@ final class memhelper
             'hash' => sha1($body),
             'indexed_at' => time()
         ]);
+        $this->upsertLinks($slug, $body);
     }
 
     private function removeEntry(string $slug): void
     {
         $this->db->delete('memories', ['slug' => $slug]);
         $this->db->delete('memhelper_state', ['slug' => $slug]);
+        // remove edges in both directions — a deleted entry stops being a
+        // source and stops being a target.
+        $this->db->delete('memhelper_links', ['from_slug' => $slug]);
+        $this->db->delete('memhelper_links', ['to_slug' => $slug]);
+    }
+
+    /**
+     * Replace the outgoing link set for `$slug` with the slugs referenced by
+     * `[[other-slug]]` patterns in `$body`. Self-loops and links to invalid
+     * slugs are dropped — the latter keeps a forward reference to a not-yet-
+     * existing memory cheap to fix later (just add the missing md).
+     */
+    private function upsertLinks(string $slug, string $body): void
+    {
+        $this->db->delete('memhelper_links', ['from_slug' => $slug]);
+        $targets = self::parseLinkTargets($body);
+        foreach ($targets as $target) {
+            if ($target === $slug || !self::isValidSlug($target)) {
+                continue;
+            }
+            try {
+                $this->db->insert('memhelper_links', [
+                    'from_slug' => $slug,
+                    'to_slug' => $target
+                ]);
+            } catch (\Throwable) {
+                // PK collision — already linked, no-op.
+            }
+        }
+    }
+
+    /** Extract `[[slug]]` references from a memory body. */
+    private static function parseLinkTargets(string $body): array
+    {
+        if (!preg_match_all('/\[\[([a-z0-9][a-z0-9_-]{0,127})\]\]/', $body, $m)) {
+            return [];
+        }
+        return array_values(array_unique($m[1]));
     }
 
     /**
@@ -749,6 +853,24 @@ final class memhelper
                 continue;
             }
             $desired[$slug] = ['path' => $file, 'mtime' => (int) filemtime($file)];
+        }
+
+        // one-shot link backfill: the diff path below only re-parses entries
+        // that actually change, so when this method runs against a populated
+        // memory store that was indexed before the links table existed (or
+        // by an older binary), unchanged rows never get their `[[…]]` edges
+        // extracted. detect that empty-but-populated state and walk every
+        // md once to seed the table.
+        $linkRows = (int) ($this->db->fetch_var('SELECT COUNT(*) FROM memhelper_links') ?? 0);
+        if ($linkRows === 0 && $desired !== []) {
+            $seeded = 0;
+            foreach ($desired as $slug => $info) {
+                $raw = (string) file_get_contents($info['path']);
+                [, $body] = self::splitFrontmatter($raw);
+                $this->upsertLinks($slug, $body);
+                $seeded++;
+            }
+            $this->log("memory-index: seeded link table from {$seeded} existing memory file(s)");
         }
 
         $rows = $this->db->fetch_all("SELECT slug, mtime, hash FROM memhelper_state WHERE kind = ?", 'memory') ?: [];
@@ -1652,12 +1774,15 @@ final class memhelper
             "  1. Extract EVERY concrete fact about people, things, preferences, projects, decisions, configurations. Be generous.\n" .
             "  2. One fact = one entry. Split combined statements into separate entries.\n" .
             "  3. If the source mentions a fact that overlaps an existing slug → use action:\"update\" with the merged content.\n" .
-            "  4. Only return [] if the source is genuinely generic (a tutorial, raw transcript, news article with no personal/project content).\n\n" .
+            "  4. Only return [] if the source is genuinely generic (a tutorial, raw transcript, news article with no personal/project content).\n" .
+            "  5. Write `content` and `description` in the LANGUAGE OF THE SOURCE. If the source mixes languages, use the dominant one. This keeps memory searchable in the user's own words.\n" .
+            "  6. When a fact references another existing slug from the list above (a person, project, thing already curated), inline that reference in `content` as `[[that-slug]]`. These cross-references are followed at retrieval time so neighbours surface together.\n\n" .
             "WORKED EXAMPLE (do NOT copy these into your output — they are illustrations only):\n" .
-            "  Source content: \"Meine Katze heißt Mochi und ich nutze vim als Editor.\"\n" .
+            "  Source content: \"Meine Katze heißt Mochi und ich nutze vim als Editor. Mochi mag meine Schwester Anna.\"\n" .
+            "  Existing slugs include: contact-anna\n" .
             "  Output: [\n" .
-            "    {\"action\":\"add\",\"slug\":\"pet-mochi\",\"content\":\"The user has a cat named Mochi.\",\"description\":\"the user's cat\",\"type\":\"user\"},\n" .
-            "    {\"action\":\"add\",\"slug\":\"editor-preference\",\"content\":\"The user prefers vim as their editor.\",\"description\":\"editor of choice\",\"type\":\"user\"}\n" .
+            "    {\"action\":\"add\",\"slug\":\"pet-mochi\",\"content\":\"Die Katze des Users heißt Mochi. Mochi mag [[contact-anna]].\",\"description\":\"die Katze des Users\",\"type\":\"user\"},\n" .
+            "    {\"action\":\"add\",\"slug\":\"editor-preference\",\"content\":\"Der User bevorzugt vim als Editor.\",\"description\":\"Editor-Präferenz\",\"type\":\"user\"}\n" .
             "  ]\n\n" .
             "NOW process the source above and return the JSON array.";
         $raw = $this->callAi($prompt);
@@ -1697,6 +1822,8 @@ final class memhelper
             "  content: full memory body (required for add/update)\n" .
             "  description: one-line summary (required for add)\n" .
             "  type: \"user\" | \"feedback\" | \"project\" | \"reference\" (required for add)\n\n" .
+            "Write `content` and `description` in the LANGUAGE OF THE CONVERSATION so retrieval matches the user's own phrasing.\n" .
+            "When a fact references an existing slug from the list above (a person, project, thing already curated), inline that reference in `content` as `[[that-slug]]` — these links are followed at retrieval time so related entries surface together.\n\n" .
             "Only include changes worth keeping. Return [] if nothing is worth saving. Respond with raw JSON, no markdown fences.";
         $this->log(sprintf('extract: calling ai (%s/%s) with prompt of %d bytes', $this->aiConfig['provider'] ?? '?', $this->aiConfig['model'] ?? '?', strlen($prompt)));
         $tStart = microtime(true);
@@ -1739,7 +1866,7 @@ final class memhelper
         }
         $this->log(sprintf('compact: evaluating %d memory entries', count($blocks)));
         $prompt =
-            "You curate a long-term memory store for an LLM assistant. The current entries are listed below. Identify duplicates, contradictions, and obsolete facts. Merge overlapping entries into a single canonical entry. Drop anything that is no longer relevant.\n\n" .
+            "You curate a long-term memory store for an LLM assistant. The current entries are listed below. Identify duplicates, contradictions, and obsolete facts. Merge overlapping entries into a single canonical entry. Drop anything that is no longer relevant. Preserve the original language of each entry and the `[[slug]]` cross-references inside bodies — those links power 1-hop expansion at retrieval time, so when merging entries, carry every link forward into the canonical entry.\n\n" .
             implode("\n\n---\n\n", $blocks) .
             "\n\nReturn a JSON array of actions using the same schema as the extract step (action, slug, content, description, type). Respond with raw JSON only, no markdown fences.";
         $tStart = microtime(true);

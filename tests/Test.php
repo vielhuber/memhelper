@@ -167,6 +167,79 @@ final class Test extends TestCase
         $this->assertStringContainsString('Helix', $block);
     }
 
+    public function testCrossReferenceExpansionPullsLinkedNeighbour(): void
+    {
+        // a query that lexically matches only one entry should still surface
+        // its [[…]]-linked neighbour because composeBlock does a 1-hop expand.
+        file_put_contents(
+            $this->tmpDir . '/contact-julia.md',
+            "---\nname: contact-julia\ndescription: contact julia fuchs\nmetadata:\n  type: user\n---\n\nJulia Fuchs ist die Schwester von [[user-name-david]].\n"
+        );
+        file_put_contents(
+            $this->tmpDir . '/user-name-david.md',
+            "---\nname: user-name-david\ndescription: name of the user\nmetadata:\n  type: user\n---\n\nDer User heißt David Vielhuber.\n"
+        );
+        $this->mem()->work();
+
+        // query references julia only — david must still appear via the link.
+        $block = $this->mem()->enhance([
+            ['role' => 'user', 'content' => 'kennst du Julia Fuchs?']
+        ]);
+        $this->assertStringContainsString('contact-julia', $block);
+        $this->assertStringContainsString('David Vielhuber', $block);
+        $this->assertStringContainsString('via [[…]] link', $block);
+    }
+
+    public function testLinkTableIsRebuiltOnFirstTickAfterUpgrade(): void
+    {
+        // simulate an upgrade: memory md files predate the links table. the
+        // first refreshMemoryIndex must backfill edges from the unchanged set
+        // — otherwise existing stores would only get links after every entry
+        // happens to be re-distilled.
+        file_put_contents(
+            $this->tmpDir . '/foo.md',
+            "---\nname: foo\ndescription: foo\nmetadata:\n  type: reference\n---\n\nFoo is connected to [[bar]].\n"
+        );
+        file_put_contents(
+            $this->tmpDir . '/bar.md',
+            "---\nname: bar\ndescription: bar\nmetadata:\n  type: reference\n---\n\nBar exists.\n"
+        );
+        $this->mem()->work();
+
+        // wipe the links table directly to simulate an older binary
+        $pdo = new \PDO('sqlite:' . $this->tmpDir . '/.data/memhelper.db');
+        $pdo->exec('DELETE FROM memhelper_links');
+
+        // next tick must repopulate
+        $this->mem()->work();
+        $rows = $pdo->query("SELECT from_slug, to_slug FROM memhelper_links")->fetchAll(\PDO::FETCH_ASSOC);
+        $this->assertCount(1, $rows);
+        $this->assertSame('foo', $rows[0]['from_slug']);
+        $this->assertSame('bar', $rows[0]['to_slug']);
+    }
+
+    public function testRemovingAnEntryClearsItsLinks(): void
+    {
+        file_put_contents(
+            $this->tmpDir . '/foo.md',
+            "---\nname: foo\ndescription: foo\nmetadata:\n  type: reference\n---\n\nLinks to [[bar]].\n"
+        );
+        file_put_contents(
+            $this->tmpDir . '/bar.md',
+            "---\nname: bar\ndescription: bar\nmetadata:\n  type: reference\n---\n\nLinks to [[foo]].\n"
+        );
+        $this->mem()->work();
+
+        $pdo = new \PDO('sqlite:' . $this->tmpDir . '/.data/memhelper.db');
+        $this->assertSame(2, (int) $pdo->query('SELECT COUNT(*) FROM memhelper_links')->fetchColumn());
+
+        unlink($this->tmpDir . '/foo.md');
+        $this->mem()->work();
+
+        $rows = $pdo->query('SELECT from_slug, to_slug FROM memhelper_links')->fetchAll(\PDO::FETCH_ASSOC);
+        $this->assertSame([], $rows, 'edges touching foo must be gone on both sides');
+    }
+
     private function seedEditorMemory(): void
     {
         file_put_contents(
