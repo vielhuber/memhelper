@@ -946,6 +946,17 @@ final class memhelper
             $body = (string) $row['body'];
             $idx = $i + 1;
             $label = (string) (self::slugToPath($slug) ?? $slug);
+            // body preview so we can confirm the right content reaches the ai
+            $bodyPreview = str_replace(
+                ["\r", "\n"],
+                ['', ' ⏎ '],
+                mb_substr($body, 0, 200)
+            );
+            $this->log(sprintf(
+                'distill: [%d/%d] %s — sending %d bytes to ai (preview: %s%s)',
+                $idx, $total, basename($label), strlen($body), $bodyPreview,
+                mb_strlen($body) > 200 ? '…' : ''
+            ));
             try {
                 [$diff, $raw] = $this->distillOne($label, $body);
             } catch (\Throwable $e) {
@@ -957,19 +968,24 @@ final class memhelper
                 $a = (string) ($d['action'] ?? 'skip');
                 $counts[$a] = ($counts[$a] ?? 0) + 1;
             }
+            $rawPreview = str_replace(
+                ["\r", "\n"],
+                ['', ' ⏎ '],
+                mb_substr($raw, 0, 300)
+            );
             $this->log(sprintf(
-                'distill: [%d/%d] %s — add=%d update=%d delete=%d skip=%d (%d bytes raw)',
+                'distill: [%d/%d] %s — ai returned %d bytes, decoded %d action(s) — add=%d update=%d delete=%d skip=%d',
                 $idx, $total, basename($label),
-                $counts['add'], $counts['update'], $counts['delete'], $counts['skip'],
-                strlen($raw)
+                strlen($raw), count($diff),
+                $counts['add'], $counts['update'], $counts['delete'], $counts['skip']
             ));
-            // when the ai produced no actions, dump the raw response so the
-            // operator can tell whether it was an empty array, prose, or
-            // something json-decode couldn't grok.
-            if ($counts['add'] + $counts['update'] + $counts['delete'] === 0) {
-                $preview = strlen($raw) > 500 ? substr($raw, 0, 500) . '… (truncated)' : $raw;
-                $this->log('distill: raw ai response was: ' . str_replace(["\r", "\n"], ['', ' ⏎ '], $preview), 'WARN');
-            }
+            // always log the raw response (truncated) so the operator can see
+            // exactly what the ai said — invaluable when 0 actions get
+            // decoded or the provider replies in an unexpected shape.
+            $this->log(
+                'distill: raw response: ' . $rawPreview . (mb_strlen($raw) > 300 ? '…' : ''),
+                $counts['add'] + $counts['update'] + $counts['delete'] === 0 ? 'WARN' : 'INFO'
+            );
             $this->applyDiff($diff);
             // mark as distilled regardless of action count — an empty diff is
             // a valid answer ("nothing in this source is worth saving") and
@@ -1276,9 +1292,25 @@ final class memhelper
     {
         $result = $this->ai()->ask(prompt: $prompt);
         if (!($result['success'] ?? false)) {
-            throw new RuntimeException('memhelper: aihelper call failed: ' . ($result['response'] ?? 'unknown error'));
+            throw new RuntimeException('memhelper: aihelper call failed: ' . self::stringifyAiResponse($result['response'] ?? null));
         }
-        return (string) ($result['response'] ?? '');
+        return self::stringifyAiResponse($result['response'] ?? '');
+    }
+
+    /**
+     * aihelper::ask() returns ['response' => ...] where the value may be a
+     * plain string OR an already-parsed JSON structure (array) — see
+     * aihelper's parseJson() path. naive `(string) $arr` would yield the
+     * literal "Array" so we re-serialise json shapes back to a string the
+     * downstream decodeDiff() understands.
+     */
+    private static function stringifyAiResponse(mixed $response): string
+    {
+        if (is_array($response)) {
+            $encoded = json_encode($response, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+            return $encoded !== false ? $encoded : '';
+        }
+        return $response === null ? '' : (string) $response;
     }
 
     private static function decodeDiff(string $raw): array
