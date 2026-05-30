@@ -29,8 +29,16 @@ final class memhelper
     private array $filesDirs;
     private array $aiConfig;
     private ?aihelper $ai = null;
-    /** @var list<array{driver: string, db: dbhelper}> */
-    private array $dbs = [];
+    /** Internal SQLite holding the FTS5 index, state table and (future) vectors. */
+    private dbhelper $db;
+    /**
+     * External input databases the worker (eventually) walks as additional
+     * knowledge sources — completely separate from the internal $db. Held as
+     * raw config arrays so connections are only opened when actually used.
+     *
+     * @var list<array<string, mixed>>
+     */
+    private array $inputDbs = [];
     private ?string $logPath = null;
 
     /**
@@ -61,46 +69,31 @@ final class memhelper
 
         $this->aiConfig = is_array($cfg['ai'] ?? null) ? $cfg['ai'] : [];
 
-        $dbList = $cfg['input_dbs'] ?? [];
-        if (!is_array($dbList) || $dbList === []) {
-            throw new RuntimeException('memhelper: input_dbs must be a non-empty list in config.yaml');
+        // internal database — required, always sqlite. holds the FTS5 index,
+        // the per-slug state table and any future vector tables. separate from
+        // anything the host application owns.
+        $dbPath = (string) ($cfg['database'] ?? '');
+        if ($dbPath === '') {
+            throw new RuntimeException('memhelper: database (absolute sqlite path) is required in config.yaml');
         }
-        foreach ($dbList as $dbc) {
-            if (!is_array($dbc)) {
-                continue;
+        $dbDir = dirname($dbPath);
+        if (!is_dir($dbDir) && !@mkdir($dbDir, 0775, true) && !is_dir($dbDir)) {
+            throw new RuntimeException('memhelper: database dir does not exist and could not be created: ' . $dbDir);
+        }
+        $this->db = new dbhelper();
+        $this->db->connect('pdo', 'sqlite', $dbPath);
+        $this->initSchemaSqlite($this->db);
+
+        // input_dbs: list of read-only knowledge sources (mysql/postgres/sqlite).
+        // configurations are stored verbatim; connections are opened lazily
+        // when the worker walks them.
+        $inputDbs = $cfg['input_dbs'] ?? [];
+        if (is_array($inputDbs)) {
+            foreach ($inputDbs as $dbc) {
+                if (is_array($dbc)) {
+                    $this->inputDbs[] = $dbc;
+                }
             }
-            $driver = (string) ($dbc['driver'] ?? 'sqlite');
-            $db = new dbhelper();
-            match ($driver) {
-                'sqlite' => $db->connect(
-                    'pdo',
-                    'sqlite',
-                    (string) ($dbc['path'] ?? ($this->output . '/.index.sqlite'))
-                ),
-                'mysql' => $db->connect(
-                    'pdo',
-                    'mysql',
-                    (string) ($dbc['host'] ?? '127.0.0.1'),
-                    (string) ($dbc['user'] ?? ''),
-                    (string) ($dbc['password'] ?? ''),
-                    (string) ($dbc['database'] ?? ''),
-                    (int) ($dbc['port'] ?? 3306)
-                ),
-                'postgres' => $db->connect(
-                    'pdo',
-                    'postgres',
-                    (string) ($dbc['host'] ?? '127.0.0.1'),
-                    (string) ($dbc['user'] ?? ''),
-                    (string) ($dbc['password'] ?? ''),
-                    (string) ($dbc['database'] ?? ''),
-                    (int) ($dbc['port'] ?? 5432)
-                ),
-                default => throw new RuntimeException(
-                    'memhelper: unsupported database driver "' . $driver . '" — use sqlite, mysql or postgres'
-                )
-            };
-            $this->initSchema($driver, $db);
-            $this->dbs[] = ['driver' => $driver, 'db' => $db];
         }
     }
 
@@ -186,7 +179,7 @@ final class memhelper
     {
         $normalized = self::normalizeConversation($conversation);
         $query = self::queryFromConversation($normalized);
-        $hits = $query !== '' ? $this->searchAcrossAll($query, 8) : [];
+        $hits = $query !== '' ? $this->search($query, 8) : [];
         $block = $this->composeBlock($hits);
         if ($normalized !== []) {
             $this->enqueueConversation($normalized);
@@ -482,33 +475,7 @@ final class memhelper
     //  Internal — search across all configured DBs
     // ====================================================================
 
-    private function searchAcrossAll(string $query, int $limit): array
-    {
-        $merged = [];
-        foreach ($this->dbs as $entry) {
-            $rows = $this->searchOne($entry['driver'], $entry['db'], $query, $limit);
-            foreach ($rows as $row) {
-                $slug = (string) ($row['slug'] ?? '');
-                if ($slug === '') {
-                    continue;
-                }
-                $score = (float) ($row['score'] ?? 0.0);
-                // sqlite bm25 returns negative scores (smaller = better); flip
-                // so larger always wins regardless of backend.
-                if ($entry['driver'] === 'sqlite') {
-                    $score = -$score;
-                }
-                if (!isset($merged[$slug]) || $score > $merged[$slug]['score']) {
-                    $row['score'] = $score;
-                    $merged[$slug] = $row;
-                }
-            }
-        }
-        usort($merged, fn(array $a, array $b): int => $b['score'] <=> $a['score']);
-        return array_slice(array_values($merged), 0, $limit);
-    }
-
-    private function searchOne(string $driver, dbhelper $db, string $q, int $limit): array
+    private function search(string $q, int $limit): array
     {
         $limit = max(1, $limit);
         $tokens = self::tokenize($q);
@@ -516,34 +483,14 @@ final class memhelper
             return [];
         }
         try {
-            return match ($driver) {
-                'sqlite' => $db->fetch_all(
-                    'SELECT slug, kind, title, snippet(memories, 3, "[", "]", "…", 12) AS snippet, bm25(memories) AS score
-                     FROM memories WHERE memories MATCH ? ORDER BY score LIMIT ?',
-                    implode(' OR ', $tokens),
-                    $limit
-                ) ?: [],
-                'mysql' => $db->fetch_all(
-                    'SELECT slug, kind, title, SUBSTRING(body, 1, 240) AS snippet,
-                            MATCH(title, body) AGAINST(?) AS score
-                     FROM memories WHERE MATCH(title, body) AGAINST(?)
-                     ORDER BY score DESC LIMIT ?',
-                    implode(' ', $tokens),
-                    implode(' ', $tokens),
-                    $limit
-                ) ?: [],
-                'postgres' => $db->fetch_all(
-                    "SELECT slug, kind, title,
-                            ts_headline('simple', body, to_tsquery('simple', ?), 'StartSel=[, StopSel=], MaxFragments=1, MaxWords=12, MinWords=4') AS snippet,
-                            ts_rank(tsv, to_tsquery('simple', ?)) AS score
-                     FROM memories WHERE tsv @@ to_tsquery('simple', ?)
-                     ORDER BY score DESC LIMIT ?",
-                    implode(' | ', $tokens),
-                    implode(' | ', $tokens),
-                    implode(' | ', $tokens),
-                    $limit
-                ) ?: []
-            };
+            // sqlite bm25 returns negative scores (smaller = better) — keep as
+            // returned, the ORDER BY ASC takes care of ranking.
+            return $this->db->fetch_all(
+                'SELECT slug, kind, title, snippet(memories, 3, "[", "]", "…", 12) AS snippet, bm25(memories) AS score
+                 FROM memories WHERE memories MATCH ? ORDER BY score LIMIT ?',
+                implode(' OR ', $tokens),
+                $limit
+            ) ?: [];
         } catch (\Throwable) {
             // malformed full-text query (e.g. unbalanced fts5 boolean) just
             // means "no hits"; don't blow up the whole prompt assembly.
@@ -583,17 +530,10 @@ final class memhelper
     //  Internal — schema + index writes (mirrored across all DBs)
     // ====================================================================
 
-    private function initSchema(string $driver, dbhelper $db): void
-    {
-        match ($driver) {
-            'sqlite' => $this->initSchemaSqlite($db),
-            'mysql' => $this->initSchemaMysql($db),
-            'postgres' => $this->initSchemaPostgres($db)
-        };
-    }
-
     private function initSchemaSqlite(dbhelper $db): void
     {
+        // detect older index files lacking the `kind` column and drop so the
+        // schema below creates the current layout. derived state — cheap to redo.
         try {
             $db->fetch_var('SELECT kind FROM memories LIMIT 0');
         } catch (\Throwable) {
@@ -616,73 +556,17 @@ final class memhelper
         $db->query('CREATE INDEX IF NOT EXISTS memhelper_state_kind ON memhelper_state(kind)');
     }
 
-    private function initSchemaMysql(dbhelper $db): void
+    private function writeEntry(string $slug, string $kind, string $title, string $body, int $mtime): void
     {
-        $db->query(
-            'CREATE TABLE IF NOT EXISTS memories (
-                slug VARCHAR(255) NOT NULL PRIMARY KEY,
-                kind VARCHAR(16) NOT NULL,
-                title TEXT,
-                body MEDIUMTEXT,
-                FULLTEXT KEY memories_ftx (title, body)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
-        );
-        $db->query(
-            'CREATE TABLE IF NOT EXISTS memhelper_state (
-                slug VARCHAR(255) NOT NULL PRIMARY KEY,
-                kind VARCHAR(16) NOT NULL,
-                mtime BIGINT NOT NULL,
-                hash VARCHAR(64) NOT NULL,
-                indexed_at BIGINT NOT NULL,
-                KEY memhelper_state_kind (kind)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
-        );
-    }
-
-    private function initSchemaPostgres(dbhelper $db): void
-    {
-        $db->query(
-            "CREATE TABLE IF NOT EXISTS memories (
-                slug TEXT PRIMARY KEY,
-                kind TEXT NOT NULL,
-                title TEXT,
-                body TEXT,
-                tsv tsvector GENERATED ALWAYS AS (
-                    setweight(to_tsvector('simple', coalesce(title, '')), 'A') ||
-                    setweight(to_tsvector('simple', coalesce(body, '')), 'B')
-                ) STORED
-            )"
-        );
-        $db->query('CREATE INDEX IF NOT EXISTS memories_tsv_idx ON memories USING gin(tsv)');
-        $db->query(
-            'CREATE TABLE IF NOT EXISTS memhelper_state (
-                slug TEXT PRIMARY KEY,
-                kind TEXT NOT NULL,
-                mtime BIGINT NOT NULL,
-                hash TEXT NOT NULL,
-                indexed_at BIGINT NOT NULL
-            )'
-        );
-        $db->query('CREATE INDEX IF NOT EXISTS memhelper_state_kind ON memhelper_state(kind)');
-    }
-
-    private function writeEntryOne(
-        dbhelper $db,
-        string $slug,
-        string $kind,
-        string $title,
-        string $body,
-        int $mtime
-    ): void {
-        $db->delete('memories', ['slug' => $slug]);
-        $db->insert('memories', [
+        $this->db->delete('memories', ['slug' => $slug]);
+        $this->db->insert('memories', [
             'slug' => $slug,
             'kind' => $kind,
             'title' => $title,
             'body' => $body
         ]);
-        $db->delete('memhelper_state', ['slug' => $slug]);
-        $db->insert('memhelper_state', [
+        $this->db->delete('memhelper_state', ['slug' => $slug]);
+        $this->db->insert('memhelper_state', [
             'slug' => $slug,
             'kind' => $kind,
             'mtime' => $mtime,
@@ -691,41 +575,27 @@ final class memhelper
         ]);
     }
 
-    private function removeEntryOne(dbhelper $db, string $slug): void
+    private function removeEntry(string $slug): void
     {
-        $db->delete('memories', ['slug' => $slug]);
-        $db->delete('memhelper_state', ['slug' => $slug]);
-    }
-
-    private function writeEntryAll(string $slug, string $kind, string $title, string $body, int $mtime): void
-    {
-        foreach ($this->dbs as $entry) {
-            $this->writeEntryOne($entry['db'], $slug, $kind, $title, $body, $mtime);
-        }
-    }
-
-    private function removeEntryAll(string $slug): void
-    {
-        foreach ($this->dbs as $entry) {
-            $this->removeEntryOne($entry['db'], $slug);
-        }
+        $this->db->delete('memories', ['slug' => $slug]);
+        $this->db->delete('memhelper_state', ['slug' => $slug]);
     }
 
     /**
      * Drop rows that exist in `memories` but have no matching state — happens
-     * after schema upgrades or out-of-band DB tampering. Keeps the per-DB
-     * state authoritative without paying the cost of a full rebuild.
+     * after schema upgrades or out-of-band DB tampering. Keeps state
+     * authoritative without paying for a full rebuild.
      */
-    private function purgeOrphans(dbhelper $db): int
+    private function purgeOrphans(): int
     {
-        $known = $db->fetch_col('SELECT slug FROM memhelper_state') ?: [];
-        $present = $db->fetch_col('SELECT slug FROM memories') ?: [];
+        $known = $this->db->fetch_col('SELECT slug FROM memhelper_state') ?: [];
+        $present = $this->db->fetch_col('SELECT slug FROM memories') ?: [];
         $orphans = array_diff(
             array_map('strval', $present),
             array_map('strval', $known)
         );
         foreach ($orphans as $slug) {
-            $db->delete('memories', ['slug' => $slug]);
+            $this->db->delete('memories', ['slug' => $slug]);
         }
         return count($orphans);
     }
@@ -736,16 +606,19 @@ final class memhelper
 
     private function refreshIndexes(): void
     {
-        $this->log('index refresh: ' . count($this->dbs) . ' db(s), ' . count($this->filesDirs) . ' files dir(s)');
-        foreach ($this->dbs as $entry) {
-            $this->refreshMarkdownInto($entry['driver'], $entry['db']);
-        }
+        $this->log(sprintf(
+            'index refresh: %d files dir(s), %d input_db(s) configured',
+            count($this->filesDirs),
+            count($this->inputDbs)
+        ));
+        $this->refreshMarkdown();
         if ($this->filesDirs !== []) {
-            $desired = $this->scanFilesDirs();
-            $textCache = [];
-            foreach ($this->dbs as $entry) {
-                $this->refreshFilesInto($entry['driver'], $entry['db'], $desired, $textCache);
-            }
+            $this->refreshFiles();
+        }
+        if ($this->inputDbs !== []) {
+            // input_dbs indexing is a planned source — for now log so the user
+            // sees that the config entries are picked up but no rows are pulled.
+            $this->log('input_dbs: configured but indexing-from-dbs is not yet implemented in this version', 'WARN');
         }
     }
 
@@ -774,12 +647,12 @@ final class memhelper
         return $desired;
     }
 
-    private function refreshMarkdownInto(string $driver, dbhelper $db): void
+    private function refreshMarkdown(): void
     {
         $tStart = microtime(true);
-        $orphans = $this->purgeOrphans($db);
+        $orphans = $this->purgeOrphans();
         if ($orphans > 0) {
-            $this->log("markdown [$driver]: dropped {$orphans} orphan(s) from memories");
+            $this->log("markdown: dropped {$orphans} orphan(s) from memories");
         }
 
         // desired = what disk says should be indexed
@@ -793,7 +666,7 @@ final class memhelper
         }
 
         // current = what state table says is indexed
-        $rows = $db->fetch_all("SELECT slug, mtime, hash FROM memhelper_state WHERE kind = ?", 'memory') ?: [];
+        $rows = $this->db->fetch_all("SELECT slug, mtime, hash FROM memhelper_state WHERE kind = ?", 'memory') ?: [];
         $current = [];
         foreach ($rows as $r) {
             $current[(string) $r['slug']] = ['mtime' => (int) $r['mtime'], 'hash' => (string) $r['hash']];
@@ -821,22 +694,22 @@ final class memhelper
 
         $total = count($toAdd) + count($toUpdate) + count($toRemove);
         if ($total === 0) {
-            $this->log(sprintf('markdown [%s]: nothing changed — unchanged=%d (%.2fs)', $driver, $unchanged, microtime(true) - $tStart));
+            $this->log(sprintf('markdown: nothing changed — unchanged=%d (%.2fs)', $unchanged, microtime(true) - $tStart));
             return;
         }
         $this->log(sprintf(
-            'markdown [%s]: plan — add=%d update=%d remove=%d unchanged=%d',
-            $driver, count($toAdd), count($toUpdate), count($toRemove), $unchanged
+            'markdown: plan — add=%d update=%d remove=%d unchanged=%d',
+            count($toAdd), count($toUpdate), count($toRemove), $unchanged
         ));
 
         // apply each change as its own write — a crash mid-loop leaves
         // already-processed slugs persisted, so the next tick picks them up
         // as unchanged and only processes the remaining diff.
         $done = 0;
-        $tag = "markdown [$driver]";
+        $tag = 'markdown';
 
         foreach ($toRemove as $slug) {
-            $this->removeEntryOne($db, $slug);
+            $this->removeEntry($slug);
             $done++;
             $this->progress($tag, $done, $total, "removed $slug");
         }
@@ -844,7 +717,7 @@ final class memhelper
             $info = $desired[$slug];
             $raw = (string) file_get_contents($info['path']);
             [$fm, $body] = self::splitFrontmatter($raw);
-            $this->writeEntryOne($db, $slug, 'memory', (string) ($fm['description'] ?? ''), $body, $info['mtime']);
+            $this->writeEntry($slug, 'memory', (string) ($fm['description'] ?? ''), $body, $info['mtime']);
             $done++;
             $this->progress($tag, $done, $total, "added $slug");
         }
@@ -856,7 +729,7 @@ final class memhelper
             if ($hash === $current[$slug]['hash']) {
                 // mtime changed but content didn't — refresh the state row's
                 // mtime without rewriting the FTS body (expensive on FTS5).
-                $db->update(
+                $this->db->update(
                     'memhelper_state',
                     ['mtime' => $info['mtime'], 'indexed_at' => time()],
                     ['slug' => $slug]
@@ -865,26 +738,23 @@ final class memhelper
                 $this->progress($tag, $done, $total, "touched $slug (mtime-only)");
                 continue;
             }
-            $this->writeEntryOne($db, $slug, 'memory', (string) ($fm['description'] ?? ''), $body, $info['mtime']);
+            $this->writeEntry($slug, 'memory', (string) ($fm['description'] ?? ''), $body, $info['mtime']);
             $done++;
             $this->progress($tag, $done, $total, "updated $slug");
         }
-        $this->log(sprintf('markdown [%s]: complete in %.2fs', $driver, microtime(true) - $tStart));
+        $this->log(sprintf('markdown: complete in %.2fs', microtime(true) - $tStart));
     }
 
-    /**
-     * @param array<string, array{path: string, mtime: int}> $desired
-     * @param array<string, ?string>                          $textCache  reused across DBs
-     */
-    private function refreshFilesInto(string $driver, dbhelper $db, array $desired, array &$textCache): void
+    private function refreshFiles(): void
     {
         $tStart = microtime(true);
-        $orphans = $this->purgeOrphans($db);
+        $desired = $this->scanFilesDirs();
+        $orphans = $this->purgeOrphans();
         if ($orphans > 0) {
-            $this->log("files [$driver]: dropped {$orphans} orphan(s)");
+            $this->log("files: dropped {$orphans} orphan(s)");
         }
 
-        $rows = $db->fetch_all("SELECT slug, mtime, hash FROM memhelper_state WHERE kind = ?", 'attached') ?: [];
+        $rows = $this->db->fetch_all("SELECT slug, mtime, hash FROM memhelper_state WHERE kind = ?", 'attached') ?: [];
         $current = [];
         foreach ($rows as $r) {
             $current[(string) $r['slug']] = ['mtime' => (int) $r['mtime'], 'hash' => (string) $r['hash']];
@@ -911,59 +781,49 @@ final class memhelper
 
         $total = count($toAdd) + count($toUpdate) + count($toRemove);
         if ($total === 0) {
-            $this->log(sprintf('files [%s]: nothing changed — unchanged=%d (%.2fs)', $driver, $unchanged, microtime(true) - $tStart));
+            $this->log(sprintf('files: nothing changed — unchanged=%d (%.2fs)', $unchanged, microtime(true) - $tStart));
             return;
         }
         $this->log(sprintf(
-            'files [%s]: plan — add=%d update=%d remove=%d unchanged=%d',
-            $driver, count($toAdd), count($toUpdate), count($toRemove), $unchanged
+            'files: plan — add=%d update=%d remove=%d unchanged=%d',
+            count($toAdd), count($toUpdate), count($toRemove), $unchanged
         ));
 
         $done = 0;
-        $tag = "files [$driver]";
+        $tag = 'files';
 
         foreach ($toRemove as $slug) {
-            $this->removeEntryOne($db, $slug);
+            $this->removeEntry($slug);
             $done++;
             $this->progress($tag, $done, $total, "removed " . basename((string) self::slugToPath($slug)));
         }
 
-        // extract text via the shared cache so multi-DB setups don't re-run
-        // pdftotext on the same file once per backend.
-        $getText = function (string $path) use (&$textCache): ?string {
-            if (!array_key_exists($path, $textCache)) {
-                $textCache[$path] = $this->extractText($path);
-            }
-            return $textCache[$path];
-        };
-
         foreach ($toAdd as $slug) {
             $info = $desired[$slug];
-            $text = $getText($info['path']);
+            $text = $this->extractText($info['path']);
             if ($text === null) {
-                // unsupported type: remove any stale row + skip without
-                // counting toward indexed totals.
-                $this->removeEntryOne($db, $slug);
+                // unsupported type: remove any stale row + skip
+                $this->removeEntry($slug);
                 $done++;
                 $this->progress($tag, $done, $total, "skipped " . basename($info['path']) . " (unsupported)");
                 continue;
             }
-            $this->writeEntryOne($db, $slug, 'attached', basename($info['path']), $text, $info['mtime']);
+            $this->writeEntry($slug, 'attached', basename($info['path']), $text, $info['mtime']);
             $done++;
             $this->progress($tag, $done, $total, "added " . basename($info['path']));
         }
 
         foreach ($toUpdate as $slug) {
             $info = $desired[$slug];
-            $text = $getText($info['path']);
+            $text = $this->extractText($info['path']);
             if ($text === null) {
-                $this->removeEntryOne($db, $slug);
+                $this->removeEntry($slug);
                 $done++;
                 $this->progress($tag, $done, $total, "dropped " . basename($info['path']) . " (no longer extractable)");
                 continue;
             }
             if (sha1($text) === $current[$slug]['hash']) {
-                $db->update(
+                $this->db->update(
                     'memhelper_state',
                     ['mtime' => $info['mtime'], 'indexed_at' => time()],
                     ['slug' => $slug]
@@ -972,11 +832,11 @@ final class memhelper
                 $this->progress($tag, $done, $total, "touched " . basename($info['path']) . " (mtime-only)");
                 continue;
             }
-            $this->writeEntryOne($db, $slug, 'attached', basename($info['path']), $text, $info['mtime']);
+            $this->writeEntry($slug, 'attached', basename($info['path']), $text, $info['mtime']);
             $done++;
             $this->progress($tag, $done, $total, "updated " . basename($info['path']));
         }
-        $this->log(sprintf('files [%s]: complete in %.2fs', $driver, microtime(true) - $tStart));
+        $this->log(sprintf('files: complete in %.2fs', microtime(true) - $tStart));
     }
 
     // ====================================================================
@@ -1145,9 +1005,9 @@ final class memhelper
         if (file_put_contents($path, $serialized) === false) {
             throw new RuntimeException('memhelper: failed to write memory file: ' . $path);
         }
-        // mirror to all DBs immediately so the next enhance() call sees the
-        // new entry without waiting for the next worker tick.
-        $this->writeEntryAll(
+        // sync to the internal db immediately so the next enhance() call sees
+        // the new entry without waiting for the next worker tick.
+        $this->writeEntry(
             $slug,
             'memory',
             (string) ($frontmatter['description'] ?? ''),
@@ -1166,7 +1026,7 @@ final class memhelper
         if (!@unlink($path)) {
             throw new RuntimeException('memhelper: failed to delete memory file: ' . $path);
         }
-        $this->removeEntryAll($slug);
+        $this->removeEntry($slug);
         return true;
     }
 

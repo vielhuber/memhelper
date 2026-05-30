@@ -52,7 +52,11 @@ input_dbs:
 ```php
 use vielhuber\memhelper\memhelper;
 
-$memory = new memhelper('/path/to/config.yaml');
+$memory = new memhelper(
+    configPath: '/path/to/config.yaml',
+    logPath: '/var/log/memhelper.log'
+);
+
 $prompt = $memory->enhance($conversation) . $prompt;
 ```
 
