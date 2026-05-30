@@ -850,9 +850,11 @@ final class memhelper
         $tStart = microtime(true);
         $desired = $this->scanFilesDirs();
 
+        // scope to attached: slugs — without this LIKE filter we would also
+        // pick up dbrow:* sources and mark them for removal, causing every
+        // db-row to thrash add→remove→add on every tick.
         $rows = $this->db->fetch_all(
-            "SELECT slug, mtime, hash FROM memhelper_state WHERE kind = ?",
-            'source'
+            "SELECT slug, mtime, hash FROM memhelper_state WHERE kind = 'source' AND slug LIKE 'attached:%'"
         ) ?: [];
         $current = [];
         foreach ($rows as $r) {

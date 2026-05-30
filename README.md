@@ -54,7 +54,7 @@ use vielhuber\memhelper\memhelper;
 
 $memory = new memhelper(
     configPath: '/path/to/config.yaml',
-    logPath: '/var/log/memhelper.log'
+    logPath: '/var/log/memory.log'
 );
 
 $prompt = $memory->enhance($conversation) . $prompt;

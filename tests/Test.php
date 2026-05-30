@@ -264,6 +264,42 @@ final class Test extends TestCase
         $this->assertSame("email: a@b.c\nname: Alice", $rows[0]['body']);
     }
 
+    public function testFileSourceRefreshDoesNotRemoveDbRowSources(): void
+    {
+        // regression: refreshFileSources used to load every kind='source'
+        // row and mark anything not in the file scan for removal — which
+        // wiped all dbrow:* rows on every tick, forcing the next pass to
+        // re-distill all db rows from scratch.
+        $extDbPath = $this->tmpDir . '/external.db';
+        $ext = new \PDO('sqlite:' . $extDbPath);
+        $ext->exec('CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)');
+        $ext->exec("INSERT INTO notes (id, body) VALUES (1, 'persistent')");
+        unset($ext);
+
+        $filesDir = $this->tmpDir . '/docs';
+        mkdir($filesDir);
+        file_put_contents($filesDir . '/notes.txt', 'file content here.');
+
+        $this->cfgPath = $this->tmpDir . '/config.yaml';
+        file_put_contents($this->cfgPath, implode("\n", [
+            'output: ' . $this->tmpDir,
+            'input_files:',
+            '    - ' . $filesDir,
+            'input_dbs:',
+            '    - driver: sqlite',
+            '      path: ' . $extDbPath,
+            ''
+        ]));
+        $this->mem()->work();
+        $this->mem()->work(); // second tick — the buggy version would remove the dbrow
+
+        $pdo = new \PDO('sqlite:' . $this->tmpDir . '/.data/memhelper.db');
+        $dbrows = (int) $pdo->query(
+            "SELECT COUNT(*) FROM memhelper_state WHERE kind='source' AND slug LIKE 'dbrow:%'"
+        )->fetchColumn();
+        $this->assertSame(1, $dbrows, 'dbrow source must survive a tick where files are also configured');
+    }
+
     public function testInputDbsRowChangesAreDetected(): void
     {
         $extDbPath = $this->tmpDir . '/external.db';
