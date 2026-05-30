@@ -117,14 +117,18 @@ final class memhelper
     private array $progressState = [];
 
     /**
-     * Throttled progress reporter — emits at most one line per ~2 s or per
-     * 10 processed items, plus a final line on completion. Keeps the log
-     * readable on initial bulk indexing of thousands of files without
-     * losing visibility of where you are.
+     * Progress reporter. Small batches (≤ 25 items) emit every step so the
+     * operator sees full activity; large batches throttle to one line per
+     * ~2 s or per 10 processed items, plus a final line on completion.
      */
     private function progress(string $tag, int $done, int $total, string $note): void
     {
         if ($total <= 0) {
+            return;
+        }
+        if ($total <= 25) {
+            $pct = (int) round($done * 100 / $total);
+            $this->log(sprintf('%s: [%d/%d] (%d%%) %s', $tag, $done, $total, $pct, $note));
             return;
         }
         $now = microtime(true);
@@ -609,10 +613,12 @@ final class memhelper
         $this->db->delete('memhelper_state', ['slug' => $slug]);
         $this->db->insert('memhelper_state', [
             'slug' => $slug,
-            'kind' => 'attached',
+            'kind' => 'source',
             'mtime' => $mtime,
             'hash' => self::SKIPPED_HASH,
-            'indexed_at' => time()
+            'indexed_at' => time(),
+            // pretend we've already distilled so distillSources skips it too
+            'distilled_at' => time()
         ]);
     }
 
@@ -768,17 +774,29 @@ final class memhelper
      */
     private function refreshSources(): void
     {
-        if ($this->filesDirs === [] && $this->inputDbs === []) {
+        // always announce what's configured so the operator can verify the
+        // resolved config is picked up. avoids the silent-skip footgun where
+        // an empty input_dbs section looks identical to a misread one.
+        $this->log(sprintf(
+            'sources: scan starting — %d files dir(s), %d input_db(s) configured',
+            count($this->filesDirs),
+            count($this->inputDbs)
+        ));
+        if ($this->inputDbs !== []) {
+            foreach ($this->inputDbs as $i => $dbc) {
+                $driver = (string) ($dbc['driver'] ?? '?');
+                $where = $driver === 'sqlite'
+                    ? (string) ($dbc['path'] ?? '?')
+                    : sprintf('%s@%s', $dbc['user'] ?? '?', $dbc['host'] ?? '?');
+                $this->log(sprintf('input_dbs: [%d] driver=%s target=%s', $i + 1, $driver, $where));
+            }
+            $this->log('input_dbs: db-row indexing is not yet implemented — sources will only come from files', 'WARN');
+        }
+        if ($this->filesDirs === []) {
             return;
         }
         $tStart = microtime(true);
-
         $desired = $this->scanFilesDirs();
-        // input_dbs are configured but the row walker is not implemented yet —
-        // surface that so the operator knows their entries are parsed but inert.
-        if ($this->inputDbs !== []) {
-            $this->log('input_dbs: configured but db-row indexing is not yet implemented', 'WARN');
-        }
 
         $rows = $this->db->fetch_all(
             "SELECT slug, mtime, hash FROM memhelper_state WHERE kind = ?",
@@ -970,7 +988,7 @@ final class memhelper
             $existing
         );
         $prompt =
-            "You curate a long-term memory store for an LLM assistant. A source has just been added or updated. Extract any durable facts worth keeping as memory entries.\n\n" .
+            "You curate a long-term memory store for an LLM assistant. A new source document has been added or updated. Extract every personal or project-specific fact worth remembering as a memory entry. Be GENEROUS — anything that personalises future assistance is valuable.\n\n" .
             "Source: " . $label . "\n" .
             "Content:\n" . $body . "\n\n" .
             "Existing memory entries (slug → description):\n" .
@@ -978,12 +996,19 @@ final class memhelper
             "\n\nReturn a JSON array of actions, each with:\n" .
             "  action: \"add\" | \"update\" | \"skip\"\n" .
             "  slug: kebab-case (existing for update, new for add)\n" .
-            "  content: full memory body (required for add/update)\n" .
+            "  content: full memory body (required for add/update) — written in third person\n" .
             "  description: one-line summary (required for add)\n" .
             "  type: \"user\" | \"feedback\" | \"project\" | \"reference\" (required for add)\n\n" .
-            "A memory entry is a distinct, durable fact — NOT the whole document. Good examples: a person's contact info, a configuration value + its purpose, a decision + its reason, a workflow step. Bad examples: generic how-to content, time-sensitive data, trivia.\n" .
-            "Many sources won't yield anything memorable — return [] in that case.\n" .
-            "Respond with raw JSON only, no markdown fences.";
+            "Examples of what to EXTRACT:\n" .
+            "  - \"Mein Hund heißt Roger\" → {action:add, slug:\"pet-roger\", content:\"The user's dog is named Roger.\", description:\"the user's dog\", type:\"user\"}\n" .
+            "  - \"Ich heiße David, lebe in Berlin\" → {action:add, slug:\"user-profile\", content:\"The user is David, based in Berlin.\", description:\"who the user is\", type:\"user\"}\n" .
+            "  - \"Ich bevorzuge Helix als Editor\" → {action:add, slug:\"editor-preferences\", content:\"User prefers Helix.\", description:\"editor of choice\", type:\"user\"}\n" .
+            "  - \"Projekt Charly nutzt PHP 8.5\" → {action:add, slug:\"charly-stack\", content:\"Charly runs on PHP 8.5.\", description:\"charly tech stack\", type:\"project\"}\n" .
+            "  - \"Meine Kollegin Anna ist für Rechnungen zuständig\" → {action:add, slug:\"colleague-anna\", content:\"Anna handles billing.\", description:\"colleague responsibilities\", type:\"user\"}\n\n" .
+            "Granularity rule: ONE distinct fact per entry. \"David has a dog named Roger\" and \"David lives in Berlin\" become TWO separate entries (pet-roger, user-profile), not one merged entry.\n\n" .
+            "If a fact extends or contradicts an existing entry, return \"update\" with the merged content instead of duplicating.\n\n" .
+            "Only return \"skip\" / an empty array when the source contains nothing personal or project-specific (e.g. a how-to article, raw transcripts without facts, time-sensitive news). Spreadsheets, contact lists, notes, contracts, and personal docs almost ALWAYS yield at least one entry.\n\n" .
+            "Respond with raw JSON only, no markdown fences, no commentary.";
         $raw = $this->callAi($prompt);
         return self::decodeDiff($raw);
     }
