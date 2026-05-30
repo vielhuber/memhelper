@@ -31,6 +31,7 @@ input_files:
 input_dbs:
     - driver: sqlite
       path: /path/to/database.db
+      include_tables: [chats_messages] # optional
 
     - driver: mysql
       host: 127.0.0.1
@@ -38,6 +39,7 @@ input_dbs:
       user: root
       password:
       database: memhelper
+      exclude_tables: [analytics_events] # optional
 
     - driver: postgres
       host: 127.0.0.1

@@ -1035,8 +1035,28 @@ final class memhelper
                 continue;
             }
             $this->log(sprintf('input_dbs[%s]: discovered %d table(s)', $alias, count($tables)));
+            // per-db scoping: `include_tables` is a whitelist (if set, every
+            // other table is skipped). `exclude_tables` adds extra entries to
+            // the built-in blacklist for this db only. lowercase compare so
+            // YAML casing differences don't matter.
+            $includeTables = isset($dbc['include_tables']) && is_array($dbc['include_tables'])
+                ? array_map('strtolower', array_map('strval', $dbc['include_tables']))
+                : null;
+            $excludeTables = is_array($dbc['exclude_tables'] ?? null)
+                ? array_map('strtolower', array_map('strval', $dbc['exclude_tables']))
+                : [];
+            $processedTables = [];
             foreach ($tables as $t) {
                 $tn = $t['name'];
+                $tnLow = strtolower($tn);
+                if ($includeTables !== null && !in_array($tnLow, $includeTables, true)) {
+                    $this->log("input_dbs[$alias:$tn]: skip — not in include_tables");
+                    continue;
+                }
+                if (in_array($tnLow, $excludeTables, true)) {
+                    $this->log("input_dbs[$alias:$tn]: skip — in exclude_tables");
+                    continue;
+                }
                 if (self::isTableBlacklisted($tn)) {
                     $this->log("input_dbs[$alias:$tn]: skip — blacklisted");
                     continue;
@@ -1059,6 +1079,7 @@ final class memhelper
                 }
                 try {
                     $this->refreshDbTable($source, $alias, $tn, $t['pkName'], $contentCols);
+                    $processedTables[] = $tn;
                 } catch (\Throwable $e) {
                     $this->log(sprintf(
                         'input_dbs[%s:%s]: failed — %s',
@@ -1066,6 +1087,47 @@ final class memhelper
                     ), 'WARN');
                 }
             }
+            $this->pruneOrphanDbSources($alias, $processedTables);
+        }
+    }
+
+    /**
+     * Drop state rows for any dbrow:<alias>:<table>:* whose table is no
+     * longer being processed (table dropped from the source db, removed
+     * from include_tables, added to exclude_tables, or now blacklisted).
+     * refreshDbTable only ever touches rows of its own table, so without
+     * this sweep those entries linger as orphans.
+     */
+    private function pruneOrphanDbSources(string $alias, array $processedTables): void
+    {
+        $slugs = $this->db->fetch_col(
+            "SELECT slug FROM memhelper_state WHERE kind = 'source' AND slug LIKE ?",
+            'dbrow:' . $alias . ':%'
+        ) ?: [];
+        if ($slugs === []) {
+            return;
+        }
+        $prefixes = [];
+        foreach ($processedTables as $t) {
+            $prefixes[] = sprintf('dbrow:%s:%s:', $alias, $t);
+        }
+        $removed = 0;
+        foreach ($slugs as $slug) {
+            $slug = (string) $slug;
+            $keep = false;
+            foreach ($prefixes as $p) {
+                if (str_starts_with($slug, $p)) {
+                    $keep = true;
+                    break;
+                }
+            }
+            if (!$keep) {
+                $this->db->delete('memhelper_state', ['slug' => $slug]);
+                $removed++;
+            }
+        }
+        if ($removed > 0) {
+            $this->log(sprintf('input_dbs[%s]: pruned %d orphan dbrow source(s)', $alias, $removed));
         }
     }
 

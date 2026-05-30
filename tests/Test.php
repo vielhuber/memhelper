@@ -264,6 +264,112 @@ final class Test extends TestCase
         $this->assertSame("email: a@b.c\nname: Alice", $rows[0]['body']);
     }
 
+    public function testInputDbsIncludeTablesActsAsWhitelist(): void
+    {
+        $extDbPath = $this->tmpDir . '/external.db';
+        $ext = new \PDO('sqlite:' . $extDbPath);
+        $ext->exec('CREATE TABLE chats_messages (id INTEGER PRIMARY KEY, content TEXT)');
+        $ext->exec('CREATE TABLE tasks (id INTEGER PRIMARY KEY, name TEXT)');
+        $ext->exec('CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)');
+        $ext->exec("INSERT INTO chats_messages (id, content) VALUES (1, 'hello there')");
+        $ext->exec("INSERT INTO tasks (id, name) VALUES (1, 'should be skipped')");
+        $ext->exec("INSERT INTO users (id, email) VALUES (1, 'also skipped')");
+        unset($ext);
+
+        $this->cfgPath = $this->tmpDir . '/config.yaml';
+        file_put_contents($this->cfgPath, implode("\n", [
+            'output: ' . $this->tmpDir,
+            'input_dbs:',
+            '    - driver: sqlite',
+            '      path: ' . $extDbPath,
+            '      include_tables: [chats_messages]',
+            ''
+        ]));
+        $this->mem()->work();
+
+        $pdo = new \PDO('sqlite:' . $this->tmpDir . '/.data/memhelper.db');
+        $rows = $pdo->query(
+            "SELECT slug FROM memhelper_state WHERE kind='source' AND slug LIKE 'dbrow:%' ORDER BY slug"
+        )->fetchAll(\PDO::FETCH_ASSOC);
+        $this->assertCount(1, $rows);
+        $this->assertSame('dbrow:external:chats_messages:1', $rows[0]['slug']);
+    }
+
+    public function testInputDbsExcludeTablesAddsToBlacklist(): void
+    {
+        $extDbPath = $this->tmpDir . '/external.db';
+        $ext = new \PDO('sqlite:' . $extDbPath);
+        $ext->exec('CREATE TABLE chats_messages (id INTEGER PRIMARY KEY, content TEXT)');
+        $ext->exec('CREATE TABLE tasks (id INTEGER PRIMARY KEY, name TEXT)');
+        $ext->exec("INSERT INTO chats_messages (id, content) VALUES (1, 'keep')");
+        $ext->exec("INSERT INTO tasks (id, name) VALUES (1, 'drop')");
+        unset($ext);
+
+        $this->cfgPath = $this->tmpDir . '/config.yaml';
+        file_put_contents($this->cfgPath, implode("\n", [
+            'output: ' . $this->tmpDir,
+            'input_dbs:',
+            '    - driver: sqlite',
+            '      path: ' . $extDbPath,
+            '      exclude_tables: [tasks]',
+            ''
+        ]));
+        $this->mem()->work();
+
+        $pdo = new \PDO('sqlite:' . $this->tmpDir . '/.data/memhelper.db');
+        $rows = $pdo->query(
+            "SELECT slug FROM memhelper_state WHERE kind='source' AND slug LIKE 'dbrow:%' ORDER BY slug"
+        )->fetchAll(\PDO::FETCH_ASSOC);
+        $this->assertCount(1, $rows);
+        $this->assertSame('dbrow:external:chats_messages:1', $rows[0]['slug']);
+    }
+
+    public function testTightenedIncludeTablesPrunesOrphanState(): void
+    {
+        // first tick indexes both tables; the second tick narrows
+        // include_tables and must prune the now-excluded table's state.
+        $extDbPath = $this->tmpDir . '/external.db';
+        $ext = new \PDO('sqlite:' . $extDbPath);
+        $ext->exec('CREATE TABLE chats_messages (id INTEGER PRIMARY KEY, content TEXT)');
+        $ext->exec('CREATE TABLE tasks (id INTEGER PRIMARY KEY, name TEXT)');
+        $ext->exec("INSERT INTO chats_messages (id, content) VALUES (1, 'keep')");
+        $ext->exec("INSERT INTO tasks (id, name) VALUES (1, 'will be orphaned')");
+        unset($ext);
+
+        $this->cfgPath = $this->tmpDir . '/config.yaml';
+        file_put_contents($this->cfgPath, implode("\n", [
+            'output: ' . $this->tmpDir,
+            'input_dbs:',
+            '    - driver: sqlite',
+            '      path: ' . $extDbPath,
+            ''
+        ]));
+        $this->mem()->work();
+
+        $pdo = new \PDO('sqlite:' . $this->tmpDir . '/.data/memhelper.db');
+        $before = (int) $pdo->query(
+            "SELECT COUNT(*) FROM memhelper_state WHERE kind='source' AND slug LIKE 'dbrow:%'"
+        )->fetchColumn();
+        $this->assertSame(2, $before);
+
+        // narrow the scope and tick again
+        file_put_contents($this->cfgPath, implode("\n", [
+            'output: ' . $this->tmpDir,
+            'input_dbs:',
+            '    - driver: sqlite',
+            '      path: ' . $extDbPath,
+            '      include_tables: [chats_messages]',
+            ''
+        ]));
+        $this->mem()->work();
+
+        $rows = $pdo->query(
+            "SELECT slug FROM memhelper_state WHERE kind='source' AND slug LIKE 'dbrow:%' ORDER BY slug"
+        )->fetchAll(\PDO::FETCH_ASSOC);
+        $this->assertCount(1, $rows);
+        $this->assertSame('dbrow:external:chats_messages:1', $rows[0]['slug']);
+    }
+
     public function testFileSourceRefreshDoesNotRemoveDbRowSources(): void
     {
         // regression: refreshFileSources used to load every kind='source'
