@@ -8,7 +8,7 @@
 
 # 🧠 memhelper 🧠
 
-Markdown-first memory layer for LLM agents. Exposes a `find_facts(query)` MCP tool that returns the curated facts most relevant to a natural-language question. A separate supervisor worker handles all writes — refreshing the search index across every configured input source, distilling new sources via an LLM, and periodically compacting duplicates and obsolete entries. Memory entries are plain `.md` files with a tiny YAML frontmatter — readable, editable, git-versionable. Cross-references between entries are written as `[[slug]]` wiki-links and followed one hop at retrieval time, so a single query surfaces related neighbours automatically.
+Markdown-first memory layer for LLM agents. Exposes a `grab(query)` MCP tool that returns the curated facts most relevant to a natural-language question. A separate supervisor worker handles all writes — refreshing the search index across every configured input source, distilling new sources via an LLM, and periodically compacting duplicates and obsolete entries. Memory entries are plain `.md` files with a tiny YAML frontmatter — readable, editable, git-versionable. Cross-references between entries are written as `[[slug]]` wiki-links and followed one hop at retrieval time, so a single query surfaces related neighbours automatically.
 
 ## installation
 
@@ -61,9 +61,12 @@ $memory = new memhelper(
     logPath: '/var/log/memory.log'
 );
 
-$facts = $memory->findFacts('how is the user\'s dog named?', limit: 10);
-// → [['slug' => 'pet-roger', 'type' => 'user', 'description' => '...',
-//     'body' => '...', 'score' => -3.41, 'via' => null], ...]
+$facts = $memory->grab(
+    query: 'how is the user\'s dog named?',
+    limit: 10
+);
+// → [['slug' => 'pet-roger', 'tags' => ['pet', 'dog'], 'description' => '...',
+//     'body' => '...', 'sources' => ['dbrow:…'], 'score' => -3.41, 'via' => null], ...]
 ```
 
 ## worker

@@ -58,20 +58,22 @@ final class Test extends TestCase
     public function testEmptyMemoryDirReturnsEmptyArray(): void
     {
         $this->mem()->work();
-        $this->assertSame([], $this->mem()->findFacts('hello'));
+        $this->assertSame([], $this->mem()->grab('hello'));
     }
 
     public function testFindFactsReturnsMatchingEntry(): void
     {
+        // new-style frontmatter with both tags + sources.
         file_put_contents(
             $this->tmpDir . '/editor-preferences.md',
-            "---\nname: editor-preferences\ndescription: editor of choice\nmetadata:\n  type: user\n---\n\nEditor is Helix.\n"
+            "---\nname: editor-preferences\ndescription: editor of choice\nmetadata:\n  tags:\n    - preference\n    - tool\n    - editor\n  sources:\n    - manual\n---\n\nEditor is Helix.\n"
         );
         $this->mem()->work();
-        $facts = $this->mem()->findFacts('what is my editor?');
+        $facts = $this->mem()->grab('what is my editor?');
         $this->assertGreaterThan(0, count($facts));
         $this->assertSame('editor-preferences', $facts[0]['slug']);
-        $this->assertSame('user', $facts[0]['type']);
+        $this->assertSame(['preference', 'tool', 'editor'], $facts[0]['tags']);
+        $this->assertSame(['manual'], $facts[0]['sources']);
         $this->assertSame('editor of choice', $facts[0]['description']);
         $this->assertSame('Editor is Helix.', $facts[0]['body']);
         $this->assertNull($facts[0]['via']);
@@ -81,8 +83,8 @@ final class Test extends TestCase
     {
         $this->seedEditorMemory();
         $this->mem()->work();
-        $this->assertSame([], $this->mem()->findFacts(''));
-        $this->assertSame([], $this->mem()->findFacts('   '));
+        $this->assertSame([], $this->mem()->grab(''));
+        $this->assertSame([], $this->mem()->grab('   '));
     }
 
     public function testInputFilesAreStagedAsSourcesForDistillation(): void
@@ -109,7 +111,7 @@ final class Test extends TestCase
     public function testCrossReferenceExpansionPullsLinkedNeighbour(): void
     {
         // a query that lexically matches only one entry should still surface
-        // its [[…]]-linked neighbour because findFacts does a 1-hop expand.
+        // its [[…]]-linked neighbour because grab does a 1-hop expand.
         file_put_contents(
             $this->tmpDir . '/contact-julia.md',
             "---\nname: contact-julia\ndescription: contact julia fuchs\nmetadata:\n  type: user\n---\n\nJulia Fuchs ist die Schwester von [[user-name-david]].\n"
@@ -120,7 +122,7 @@ final class Test extends TestCase
         );
         $this->mem()->work();
 
-        $facts = $this->mem()->findFacts('kennst du Julia Fuchs?');
+        $facts = $this->mem()->grab('kennst du Julia Fuchs?');
         $slugs = array_column($facts, 'slug');
         $this->assertContains('contact-julia', $slugs);
         $this->assertContains('user-name-david', $slugs);

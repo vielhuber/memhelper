@@ -17,7 +17,7 @@ use vielhuber\simplemcp\Attributes\Schema;
  * memhelper — markdown-first memory layer for LLM agents.
  *
  *   $mem = new memhelper('/path/to/config.yaml');        // yaml path is required
- *   $facts = $mem->findFacts('how is X named?');         // host API
+ *   $facts = $mem->grab('how is X named?');         // host API
  *   $mem->work();                                        // worker tick
  *
  * Plain `.md` files under `output` stay the source of truth. The configured
@@ -169,19 +169,19 @@ final class memhelper
      * Look up curated facts for a natural-language query. Tokenises the
      * query, runs the fts5 search, expands hits by one hop along the
      * `[[…]]` link graph and returns the matching memory entries as raw
-     * structured data (slug, type, description, body, score, via).
+     * structured data (slug, tags, description, body, sources, score, via).
      *
      * This is both the host-facing PHP method AND the MCP-exposed tool
      * (simplemcp's discovery picks the `#[McpTool]` attribute up directly,
      * so there is no separate wrapper class to keep in sync).
      *
-     * @return list<array{slug:string,type:string,description:string,body:string,score:float|null,via:string|null}>
+     * @return list<array{slug:string,tags:list<string>,description:string,body:string,sources:list<string>,score:float|null,via:string|null}>
      */
     #[McpTool(
-        name: 'find_facts',
-        description: 'Look up curated facts the assistant has stored about the user, their projects, contacts, contracts, preferences and recurring rules. Returns an array of `{slug, type, description, body, score, via}` entries. Cross-references between facts (`[[slug]]`) are followed one hop and surface as `via:"link"` neighbours. Use this whenever an answer depends on prior personal knowledge — names, family, household details, accounts, dates, preferences, established routines.'
+        name: 'grab',
+        description: 'Look up curated facts the assistant has stored about the user, their projects, contacts, contracts, preferences and recurring rules. Returns an array of `{slug, tags, description, body, sources, score, via}` entries. `tags` are free-form keywords attached by the curator. `sources` is the provenance list — which raw input rows or file paths produced this fact (`dbrow:…`, `attached:…`, `compact:…`). Cross-references between facts (`[[slug]]`) are followed one hop and surface as `via:"link"` neighbours. Use this whenever an answer depends on prior personal knowledge — names, family, household details, accounts, dates, preferences, established routines.'
     )]
-    public function findFacts(
+    public function grab(
         #[Schema(
             description: 'Natural-language query, e.g. "Wie heißt der Hund von David?" or "monthly hosting cost". Matches the curated entries via full-text search over their bodies.'
         )]
@@ -197,7 +197,7 @@ final class memhelper
         $query = trim($query);
         $limit = max(1, min(20, $limit));
         if ($query === '') {
-            $this->log('find_facts: empty query — returning []');
+            $this->log('grab: empty query — returning []');
             return [];
         }
         $hits = $this->search($query, $limit);
@@ -224,9 +224,10 @@ final class memhelper
             $seen[$slug] = true;
             $results[] = [
                 'slug' => $slug,
-                'type' => (string) ($entry['frontmatter']['metadata']['type'] ?? 'reference'),
+                'tags' => self::readTags($entry['frontmatter']),
                 'description' => (string) ($entry['frontmatter']['description'] ?? ''),
                 'body' => trim((string) $entry['body']),
+                'sources' => self::readSources($entry['frontmatter']),
                 'score' => isset($h['score']) ? (float) $h['score'] : null,
                 'via' => null
             ];
@@ -242,15 +243,16 @@ final class memhelper
             $seen[$slug] = true;
             $results[] = [
                 'slug' => $slug,
-                'type' => (string) ($entry['frontmatter']['metadata']['type'] ?? 'reference'),
+                'tags' => self::readTags($entry['frontmatter']),
                 'description' => (string) ($entry['frontmatter']['description'] ?? ''),
                 'body' => trim((string) $entry['body']),
+                'sources' => self::readSources($entry['frontmatter']),
                 'score' => null,
                 'via' => 'link'
             ];
         }
         $this->log(sprintf(
-            'find_facts: query=%dB hits=%d neighbours=%d returned=%d',
+            'grab: query=%dB hits=%d neighbours=%d returned=%d',
             strlen($query), count($hits), count($neighbours), count($results)
         ));
         return $results;
@@ -265,7 +267,7 @@ final class memhelper
      * One iteration of background maintenance: refresh sources, distil them
      * via ai, sync the curated mds into the fts5 index, and run the
      * once-per-day compaction pass when due. Read access for hosts goes
-     * through findFacts().
+     * through grab().
      */
     public function work(): void
     {
@@ -379,7 +381,7 @@ final class memhelper
     }
 
     // ====================================================================
-    //  Internal — 1-hop link expansion (used by findFacts)
+    //  Internal — 1-hop link expansion (used by grab)
     // ====================================================================
 
     /**
@@ -1570,7 +1572,7 @@ final class memhelper
                 'distill: raw response: ' . $rawPreview . (mb_strlen($raw) > 300 ? '…' : ''),
                 $counts['add'] + $counts['update'] + $counts['delete'] === 0 ? 'WARN' : 'INFO'
             );
-            $this->applyDiff($diff);
+            $this->applyDiff($diff, $slug);
             // mark as distilled regardless of action count — an empty diff is
             // a valid answer ("nothing in this source is worth saving") and
             // shouldn't keep coming back to the ai on every tick.
@@ -1595,7 +1597,10 @@ final class memhelper
     {
         $existing = $this->listMemories();
         $indexLines = array_map(
-            fn(array $e): string => '- ' . $e['slug'] . ' (' . ($e['type'] ?? 'reference') . '): ' . ($e['description'] ?? ''),
+            function (array $e): string {
+                $tagSuffix = empty($e['tags']) ? '' : ' [' . implode(', ', $e['tags']) . ']';
+                return '- ' . $e['slug'] . $tagSuffix . ': ' . ($e['description'] ?? '');
+            },
             $existing
         );
         $prompt =
@@ -1612,7 +1617,7 @@ final class memhelper
             "  - slug: kebab-case identifier (new slug for add, existing slug for update)\n" .
             "  - content: the memory body, written in third person\n" .
             "  - description: a one-line summary\n" .
-            "  - type: one of \"user\", \"feedback\", \"project\", \"reference\"\n\n" .
+            "  - tags: a list of 1-5 lower-case keyword strings (free-form). Pick concrete keywords that describe the fact (entity types, domains, topics) — e.g. `[\"contact\",\"family\"]`, `[\"contract\",\"hosting\",\"monthly\"]`, `[\"rule\",\"email\"]`. Reuse tags across related entries so they cluster — when the index above already shows tags in `[brackets]` after a slug, prefer those over inventing synonyms.\n\n" .
             "RULES:\n" .
             "  1. CROSS-LINK AGGRESSIVELY. Whenever an entry mentions an entity (person, project, account, household, contract, recurring concept), inline a `[[that-slug]]` reference to it. This applies BOTH to slugs already in the list above AND to slugs you are creating in THIS SAME response — list newly-added slugs first, then reference them from later entries. Cross-references are how related memories surface together at retrieval time. An entry without any `[[…]]` is almost always a missed opportunity unless the fact is genuinely standalone.\n" .
             "  2. When several entries share a recurring umbrella concept (e.g. \"household budget\", \"family\", \"vehicle fleet\", a specific contract suite), add ONE hub entry for the umbrella and link every related entry from it as `[[hub-slug]]` references inside the hub's content.\n" .
@@ -1620,29 +1625,29 @@ final class memhelper
             "  4. One fact = one entry. Split combined statements into separate entries.\n" .
             "  5. If the source mentions a fact that overlaps an existing slug → use action:\"update\" with the merged content.\n" .
             "  6. Only return [] if the source is genuinely generic (a tutorial, raw transcript, news article with no personal/project content).\n" .
-            "  7. Write `content` and `description` in the LANGUAGE OF THE SOURCE. If the source mixes languages, use the dominant one. This keeps memory searchable in the user's own words.\n\n" .
+            "  7. Write `content` and `description` in the LANGUAGE OF THE SOURCE. If the source mixes languages, use the dominant one. This keeps memory searchable in the user's own words. Tags stay lower-case English keywords regardless of source language.\n\n" .
             "WORKED EXAMPLE A — linking to a PRE-EXISTING slug (do NOT copy these into your output — they are illustrations only):\n" .
             "  Source content: \"Meine Katze heißt Mochi und ich nutze vim als Editor. Mochi mag meine Schwester Anna.\"\n" .
-            "  Existing slugs include: contact-anna\n" .
+            "  Existing slugs include: contact-anna [contact, family]\n" .
             "  Output: [\n" .
-            "    {\"action\":\"add\",\"slug\":\"pet-mochi\",\"content\":\"Die Katze des Users heißt Mochi. Mochi mag [[contact-anna]].\",\"description\":\"die Katze des Users\",\"type\":\"user\"},\n" .
-            "    {\"action\":\"add\",\"slug\":\"editor-preference\",\"content\":\"Der User bevorzugt vim als Editor.\",\"description\":\"Editor-Präferenz\",\"type\":\"user\"}\n" .
+            "    {\"action\":\"add\",\"slug\":\"pet-mochi\",\"content\":\"Die Katze des Users heißt Mochi. Mochi mag [[contact-anna]].\",\"description\":\"die Katze des Users\",\"tags\":[\"pet\",\"cat\"]},\n" .
+            "    {\"action\":\"add\",\"slug\":\"editor-preference\",\"content\":\"Der User bevorzugt vim als Editor.\",\"description\":\"Editor-Präferenz\",\"tags\":[\"preference\",\"tool\",\"editor\"]}\n" .
             "  ]\n\n" .
             "WORKED EXAMPLE B — linking to slugs ADDED IN THE SAME BATCH + a HUB entry:\n" .
             "  Source content: \"Lorenz und Rosalie sind meine Kinder. Lorenz spielt Fußball, Rosalie geht zur Ballettstunde.\"\n" .
             "  Existing slugs include: (none relevant)\n" .
             "  Output: [\n" .
-            "    {\"action\":\"add\",\"slug\":\"contact-lorenz\",\"content\":\"Lorenz ist Sohn des Users. Lorenz spielt Fußball.\",\"description\":\"Sohn des Users\",\"type\":\"user\"},\n" .
-            "    {\"action\":\"add\",\"slug\":\"contact-rosalie\",\"content\":\"Rosalie ist Tochter des Users. Rosalie geht zur Ballettstunde.\",\"description\":\"Tochter des Users\",\"type\":\"user\"},\n" .
-            "    {\"action\":\"add\",\"slug\":\"children-of-user\",\"content\":\"Die Kinder des Users sind [[contact-lorenz]] und [[contact-rosalie]].\",\"description\":\"die Kinder des Users\",\"type\":\"user\"}\n" .
+            "    {\"action\":\"add\",\"slug\":\"contact-lorenz\",\"content\":\"Lorenz ist Sohn des Users. Lorenz spielt Fußball.\",\"description\":\"Sohn des Users\",\"tags\":[\"contact\",\"family\",\"child\"]},\n" .
+            "    {\"action\":\"add\",\"slug\":\"contact-rosalie\",\"content\":\"Rosalie ist Tochter des Users. Rosalie geht zur Ballettstunde.\",\"description\":\"Tochter des Users\",\"tags\":[\"contact\",\"family\",\"child\"]},\n" .
+            "    {\"action\":\"add\",\"slug\":\"children-of-user\",\"content\":\"Die Kinder des Users sind [[contact-lorenz]] und [[contact-rosalie]].\",\"description\":\"die Kinder des Users\",\"tags\":[\"family\",\"hub\"]}\n" .
             "  ]\n\n" .
             "WORKED EXAMPLE C — recurring umbrella across many entries (the haushaltsbuch pattern):\n" .
             "  Source content: \"Im Haushaltsbuch: All-Inkl 177€/Jahr, Vodafone GigaZuhause 64,99€/Monat, HelloFresh 165,96€/Monat.\"\n" .
             "  Output: [\n" .
-            "    {\"action\":\"add\",\"slug\":\"hosting-all-inkl\",\"content\":\"Der User nutzt All-Inkl. Im [[household-budget]] sind 177€ jährlich angesetzt.\",\"description\":\"...\",\"type\":\"user\"},\n" .
-            "    {\"action\":\"add\",\"slug\":\"internet-vodafone\",\"content\":\"Der User nutzt Vodafone GigaZuhause. Im [[household-budget]] sind 64,99€ monatlich angesetzt.\",\"description\":\"...\",\"type\":\"user\"},\n" .
-            "    {\"action\":\"add\",\"slug\":\"food-hellofresh\",\"content\":\"Der User nutzt HelloFresh. Im [[household-budget]] sind 165,96€ monatlich angesetzt.\",\"description\":\"...\",\"type\":\"user\"},\n" .
-            "    {\"action\":\"add\",\"slug\":\"household-budget\",\"content\":\"Das Haushaltsbuch des Users umfasst u.a. [[hosting-all-inkl]], [[internet-vodafone]], [[food-hellofresh]].\",\"description\":\"Haushaltsbuch-Übersicht\",\"type\":\"project\"}\n" .
+            "    {\"action\":\"add\",\"slug\":\"hosting-all-inkl\",\"content\":\"Der User nutzt All-Inkl. Im [[household-budget]] sind 177€ jährlich angesetzt.\",\"description\":\"...\",\"tags\":[\"contract\",\"hosting\",\"yearly\"]},\n" .
+            "    {\"action\":\"add\",\"slug\":\"internet-vodafone\",\"content\":\"Der User nutzt Vodafone GigaZuhause. Im [[household-budget]] sind 64,99€ monatlich angesetzt.\",\"description\":\"...\",\"tags\":[\"contract\",\"internet\",\"monthly\"]},\n" .
+            "    {\"action\":\"add\",\"slug\":\"food-hellofresh\",\"content\":\"Der User nutzt HelloFresh. Im [[household-budget]] sind 165,96€ monatlich angesetzt.\",\"description\":\"...\",\"tags\":[\"contract\",\"food\",\"subscription\",\"monthly\"]},\n" .
+            "    {\"action\":\"add\",\"slug\":\"household-budget\",\"content\":\"Das Haushaltsbuch des Users umfasst u.a. [[hosting-all-inkl]], [[internet-vodafone]], [[food-hellofresh]].\",\"description\":\"Haushaltsbuch-Übersicht\",\"tags\":[\"budget\",\"household\",\"hub\"]}\n" .
             "  ]\n\n" .
             "NOW process the source above and return the JSON array.";
         $raw = $this->callAi($prompt);
@@ -1663,9 +1668,10 @@ final class memhelper
         foreach (glob($this->output . '/*.md') ?: [] as $file) {
             $raw = (string) file_get_contents($file);
             [$fm, $body] = self::splitFrontmatter($raw);
+            $tags = self::readTags($fm);
             $blocks[] =
                 '## ' . basename($file, '.md') .
-                ' (type: ' . ($fm['metadata']['type'] ?? 'reference') . ')' .
+                ($tags === [] ? '' : ' (tags: ' . implode(', ', $tags) . ')') .
                 "\nDescription: " . ($fm['description'] ?? '') .
                 "\n\n" . trim($body);
         }
@@ -1681,7 +1687,7 @@ final class memhelper
             "  3. PRESERVE every existing `[[slug]]` cross-reference when rewriting bodies — those links power 1-hop expansion at retrieval time.\n" .
             "  4. PRESERVE the original language of each entry — never translate.\n\n" .
             implode("\n\n---\n\n", $blocks) .
-            "\n\nReturn a JSON array of actions using the same schema as the extract step (action, slug, content, description, type). Respond with raw JSON only, no markdown fences.";
+            "\n\nReturn a JSON array of actions using the same schema as the extract step (action, slug, content, description, tags). `tags` is a list of lower-case keyword strings — keep, narrow or extend the existing tag set when rewriting; do not invent unrelated tags. Respond with raw JSON only, no markdown fences.";
         $tStart = microtime(true);
         try {
             $raw = $this->callAi($prompt);
@@ -1691,7 +1697,7 @@ final class memhelper
         }
         $diff = self::decodeDiff($raw);
         $this->log(sprintf('compact: ai responded in %.2fs, decoded %d action(s)', microtime(true) - $tStart, count($diff)));
-        $this->applyDiff($diff);
+        $this->applyDiff($diff, 'compact:' . date('c'));
     }
 
     private function shouldCompact(): bool
@@ -1717,7 +1723,13 @@ final class memhelper
         }
     }
 
-    private function applyDiff(array $diff): void
+    /**
+     * @param string|null $source Provenance stamp the worker attributes to
+     *   every add/update produced by this diff. Distillation passes the
+     *   `memhelper_state.slug` of the source row; compaction passes a
+     *   `compact:<iso-ts>` marker; null = "do not record provenance".
+     */
+    private function applyDiff(array $diff, ?string $source = null): void
     {
         foreach ($diff as $action) {
             $a = (string) ($action['action'] ?? 'skip');
@@ -1731,7 +1743,8 @@ final class memhelper
                         $slug,
                         (string) ($action['content'] ?? ''),
                         isset($action['description']) ? (string) $action['description'] : null,
-                        isset($action['type']) ? (string) $action['type'] : null
+                        self::normaliseTagList($action['tags'] ?? null),
+                        $source
                     ),
                     'delete' => $this->deleteMemory($slug),
                     default => null
@@ -1744,25 +1757,128 @@ final class memhelper
         }
     }
 
+    /**
+     * Normalise whatever the ai dropped in the `tags` field of a diff action
+     * to a clean `list<string>` (or null for "untouched"). Accepts an array,
+     * a comma-separated string, or null. Empty / whitespace entries dropped,
+     * duplicates collapsed, everything lower-cased to ease search.
+     */
+    private static function normaliseTagList(mixed $raw): ?array
+    {
+        if ($raw === null) {
+            return null;
+        }
+        if (is_string($raw)) {
+            $raw = preg_split('/[,;]+/', $raw) ?: [];
+        }
+        if (!is_array($raw)) {
+            return [];
+        }
+        $out = [];
+        foreach ($raw as $t) {
+            if (!is_scalar($t)) continue;
+            $t = trim(mb_strtolower((string) $t));
+            if ($t === '') continue;
+            $out[$t] = true;
+        }
+        return array_keys($out);
+    }
+
+    /**
+     * Read the tag list from a frontmatter array. Falls back to a legacy
+     * `metadata.type` value (the pre-tags categorisation) so entries created
+     * by older worker versions still expose something useful.
+     *
+     * @return list<string>
+     */
+    private static function readTags(array $frontmatter): array
+    {
+        $rawTags = $frontmatter['metadata']['tags'] ?? null;
+        $tags = self::normaliseTagList($rawTags) ?? [];
+        if ($tags === []) {
+            $legacyType = $frontmatter['metadata']['type'] ?? null;
+            if (is_string($legacyType) && $legacyType !== '') {
+                $tags = [mb_strtolower($legacyType)];
+            }
+        }
+        return $tags;
+    }
+
+    /**
+     * Read the provenance source list from a frontmatter array. Sources are
+     * deterministic stamps the worker writes (not the AI) — for `distill`
+     * the source is the `memhelper_state.slug` that fed the AI; for
+     * `compact` it's `compact:<iso-timestamp>`; manual edits remain unmarked.
+     *
+     * @return list<string>
+     */
+    private static function readSources(array $frontmatter): array
+    {
+        $raw = $frontmatter['metadata']['sources'] ?? null;
+        if ($raw === null) {
+            return [];
+        }
+        if (is_string($raw)) {
+            $raw = [$raw];
+        }
+        if (!is_array($raw)) {
+            return [];
+        }
+        $out = [];
+        foreach ($raw as $s) {
+            if (!is_scalar($s)) continue;
+            $s = trim((string) $s);
+            if ($s === '') continue;
+            $out[$s] = true;
+        }
+        return array_keys($out);
+    }
+
     // ====================================================================
     //  Internal — markdown CRUD (used by extraction/compaction)
     // ====================================================================
 
-    private function saveMemory(string $slug, string $content, ?string $description, ?string $type): void
-    {
+    /**
+     * @param list<string>|null $tags    null = keep existing tags on update,
+     *                                    []   = explicitly clear,
+     *                                    list = replace
+     * @param string|null       $source  if set, appended (unique) to the
+     *                                    entry's provenance list
+     */
+    private function saveMemory(
+        string $slug,
+        string $content,
+        ?string $description,
+        ?array $tags,
+        ?string $source = null
+    ): void {
         self::assertValidSlug($slug);
         $path = $this->pathForSlug($slug);
         $existing = is_file($path) ? self::splitFrontmatter((string) file_get_contents($path))[0] : [];
+        if ($tags === null) {
+            $tags = self::readTags($existing);
+        }
+        $sources = self::readSources($existing);
+        if ($source !== null && $source !== '' && !in_array($source, $sources, true)) {
+            $sources[] = $source;
+        }
+        $metadata = [];
+        if ($tags !== []) {
+            $metadata['tags'] = $tags;
+        }
+        if ($sources !== []) {
+            $metadata['sources'] = $sources;
+        }
         $frontmatter = [
             'name' => $slug,
             'description' => $description ?? ($existing['description'] ?? ''),
-            'metadata' => ['type' => $type ?? ($existing['metadata']['type'] ?? 'reference')]
+            'metadata' => $metadata
         ];
         $serialized = self::renderFrontmatter($frontmatter) . trim($content) . "\n";
         if (file_put_contents($path, $serialized) === false) {
             throw new RuntimeException('memhelper: failed to write memory file: ' . $path);
         }
-        // sync to the internal db immediately so the next findFacts() call
+        // sync to the internal db immediately so the next grab() call
         // sees the new entry without waiting for the next worker tick.
         $this->writeEntry(
             $slug,
@@ -1798,20 +1914,16 @@ final class memhelper
         return ['slug' => $slug, 'frontmatter' => $fm, 'body' => $body];
     }
 
-    private function listMemories(?string $type = null): array
+    private function listMemories(): array
     {
         $out = [];
         foreach (glob($this->output . '/*.md') ?: [] as $file) {
             $head = (string) file_get_contents($file, false, null, 0, 4096);
             [$fm] = self::splitFrontmatter($head);
-            $entryType = $fm['metadata']['type'] ?? null;
-            if ($type !== null && $entryType !== $type) {
-                continue;
-            }
             $out[] = [
                 'slug' => basename($file, '.md'),
-                'description' => $fm['description'] ?? '',
-                'type' => $entryType
+                'description' => (string) ($fm['description'] ?? ''),
+                'tags' => self::readTags($fm)
             ];
         }
         return $out;
@@ -2070,64 +2182,22 @@ final class memhelper
         }
         $yamlBlock = substr($rest, 0, $m[0][1]);
         $body = substr($rest, $m[0][1] + strlen($m[0][0]));
-        return [self::parseTinyYaml($yamlBlock), $body];
-    }
-
-    private static function parseTinyYaml(string $yaml): array
-    {
-        $out = [];
-        $nested = null;
-        foreach (preg_split('/\r?\n/', $yaml) ?: [] as $line) {
-            if ($line === '' || str_starts_with(ltrim($line), '#')) {
-                continue;
-            }
-            if (str_starts_with($line, '  ') && $nested !== null) {
-                $kv = explode(':', trim($line), 2);
-                if (count($kv) === 2) {
-                    $out[$nested][trim($kv[0])] = trim($kv[1], " \"'");
-                }
-                continue;
-            }
-            $nested = null;
-            $kv = explode(':', $line, 2);
-            if (count($kv) !== 2) {
-                continue;
-            }
-            $key = trim($kv[0]);
-            $value = trim($kv[1]);
-            if ($value === '') {
-                $out[$key] = [];
-                $nested = $key;
-            } else {
-                $out[$key] = trim($value, " \"'");
-            }
+        try {
+            $parsed = Yaml::parse($yamlBlock);
+            return [is_array($parsed) ? $parsed : [], $body];
+        } catch (\Throwable) {
+            // unparseable frontmatter — degrade gracefully, treat the whole
+            // thing as body so the entry is still searchable.
+            return [[], $raw];
         }
-        return $out;
     }
 
     private static function renderFrontmatter(array $fm): string
     {
-        $lines = ['---'];
-        foreach ($fm as $k => $v) {
-            if (is_array($v)) {
-                $lines[] = $k . ':';
-                foreach ($v as $ck => $cv) {
-                    $lines[] = '  ' . $ck . ': ' . self::yamlScalar((string) $cv);
-                }
-            } else {
-                $lines[] = $k . ': ' . self::yamlScalar((string) $v);
-            }
-        }
-        $lines[] = '---';
-        $lines[] = '';
-        return implode("\n", $lines) . "\n";
-    }
-
-    private static function yamlScalar(string $value): string
-    {
-        if ($value === '' || preg_match('/[:#]|^\s|^-/', $value)) {
-            return '"' . str_replace('"', '\\"', $value) . '"';
-        }
-        return $value;
+        // Symfony's dumper handles nested lists, multi-line strings and
+        // scalar quoting correctly — replacing the hand-rolled emitter
+        // is what makes tags + sources round-trip without truncation.
+        $yaml = Yaml::dump($fm, 4, 2);
+        return "---\n" . $yaml . "---\n\n";
     }
 }
