@@ -1614,7 +1614,7 @@ final class memhelper
             "\n\n" .
             "OUTPUT: Reply with a JSON array — nothing before or after, no markdown fences. Each item has:\n" .
             "  - action: \"add\" or \"update\"\n" .
-            "  - slug: kebab-case identifier (new slug for add, existing slug for update)\n" .
+            "  - slug: kebab-case identifier — ALWAYS lower-case **English** keywords regardless of source language. Slugs are stable identifiers in a single namespace; mixing languages (`pets-of-household` next to `meinung-friseur-donauwelle`) produces near-duplicates that never cluster. Use English even when content/description stay in the source language.\n" .
             "  - content: the memory body, written in third person\n" .
             "  - description: a one-line summary\n" .
             "  - tags: a list of 1-5 lower-case keyword strings (free-form). Pick concrete keywords that describe the fact (entity types, domains, topics) — e.g. `[\"contact\",\"family\"]`, `[\"contract\",\"hosting\",\"monthly\"]`, `[\"rule\",\"email\"]`. Reuse tags across related entries so they cluster — when the index above already shows tags in `[brackets]` after a slug, prefer those over inventing synonyms.\n\n" .
