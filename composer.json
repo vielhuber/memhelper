@@ -1,15 +1,15 @@
 {
     "name": "vielhuber/memhelper",
-    "description": "Markdown-first memory layer for LLM agents — one call, transparent indexing and auto-extraction.",
+    "description": "Markdown-first memory layer for LLM agents \u2014 one call, transparent indexing and auto-extraction.",
     "license": "MIT",
     "require": {
         "php": "^8.3",
         "ext-pdo": "*",
         "ext-json": "*",
-        "symfony/yaml": "^7.0",
-        "vielhuber/aihelper": "*",
-        "vielhuber/dbhelper": "*",
-        "vielhuber/simplemcp": "*"
+        "symfony/yaml": "^8.1.0",
+        "vielhuber/aihelper": "^3.7.1",
+        "vielhuber/dbhelper": "^2.5.0",
+        "vielhuber/simplemcp": "^1.1.4"
     },
     "suggest": {
         "ext-pdo_sqlite": "Required for the internal FTS5 search index",
