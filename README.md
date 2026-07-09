@@ -23,6 +23,8 @@ ai:
     api_key: sk-...
 
 output: /path/to/memory
+max_source_bytes: 20000
+existing_memory_limit: 200
 
 input_files:
     - /path/to/external/docs

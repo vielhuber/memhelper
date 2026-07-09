@@ -42,6 +42,8 @@ final class memhelper
      */
     private array $inputDbs = [];
     private ?string $logPath = null;
+    private int $maxSourceBytes;
+    private int $existingMemoryLimit;
 
     /**
      * The host may pass the absolute path of its memhelper yaml explicitly,
@@ -79,6 +81,8 @@ final class memhelper
             : [];
 
         $this->aiConfig = is_array($cfg['ai'] ?? null) ? $cfg['ai'] : [];
+        $this->maxSourceBytes = max(1000, (int) ($cfg['max_source_bytes'] ?? 20000));
+        $this->existingMemoryLimit = max(0, (int) ($cfg['existing_memory_limit'] ?? 200));
 
         // internal database — always sqlite, always lives under .data/ of the
         // output directory. no user-facing config knob, no path-collision risk.
@@ -1530,6 +1534,9 @@ final class memhelper
         foreach ($sources as $i => $row) {
             $slug = (string) $row['slug'];
             $body = (string) $row['body'];
+            if (strlen($body) > $this->maxSourceBytes) {
+                $body = mb_substr($body, 0, $this->maxSourceBytes) . "\n\n[truncated]";
+            }
             $idx = $i + 1;
             $label = (string) (self::slugToPath($slug) ?? $slug);
             // body preview so we can confirm the right content reaches the ai
@@ -1547,6 +1554,13 @@ final class memhelper
                 [$diff, $raw] = $this->distillOne($label, $body);
             } catch (\Throwable $e) {
                 $this->log(sprintf('distill: [%d/%d] %s — ai failed: %s', $idx, $total, basename($label), $e->getMessage()), 'WARN');
+                if (str_contains(strtolower($e->getMessage()), 'context window')) {
+                    $this->db->update(
+                        'memhelper_state',
+                        ['distilled_at' => time()],
+                        ['slug' => $slug]
+                    );
+                }
                 continue;
             }
             $counts = ['add' => 0, 'update' => 0, 'delete' => 0, 'skip' => 0];
@@ -1595,7 +1609,7 @@ final class memhelper
      */
     private function distillOne(string $label, string $body): array
     {
-        $existing = $this->listMemories();
+        $existing = array_slice($this->listMemories(), 0, $this->existingMemoryLimit);
         $indexLines = array_map(
             function (array $e): string {
                 $tagSuffix = empty($e['tags']) ? '' : ' [' . implode(', ', $e['tags']) . ']';
