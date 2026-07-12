@@ -61,6 +61,15 @@ final class Test extends TestCase
         $this->assertSame([], $this->mem()->grab('hello'));
     }
 
+    public function testFirstTickDoesNotReportANonexistentLockAsStale(): void
+    {
+        $logPath = $this->tmpDir . '/memory.log';
+
+        (new memhelper($this->cfgPath, $logPath))->work();
+
+        $this->assertStringNotContainsString('takeover stale lock', (string) file_get_contents($logPath));
+    }
+
     public function testFindFactsReturnsMatchingEntry(): void
     {
         // new-style frontmatter with both tags + sources.

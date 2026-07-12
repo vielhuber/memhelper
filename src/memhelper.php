@@ -30,7 +30,6 @@ final class memhelper
     /** @var list<string> */
     private array $filesDirs;
     private array $aiConfig;
-    private ?aihelper $ai = null;
     /** Internal SQLite holding the FTS5 index, state table and (future) vectors. */
     private dbhelper $db;
     /**
@@ -322,7 +321,7 @@ final class memhelper
                 'SELECT value, updated_at FROM memhelper_meta WHERE key = ?',
                 self::TICK_LOCK_KEY
             );
-            if ($row !== null) {
+            if (is_array($row)) {
                 $heldPid = (int) ($row['value'] ?? 0);
                 $heldAt = (int) ($row['updated_at'] ?? 0);
                 $fresh = ($now - $heldAt) < self::TICK_LOCK_TTL_SECONDS;
@@ -357,7 +356,10 @@ final class memhelper
     private function releaseTickLock(): void
     {
         try {
-            $this->db->delete('memhelper_meta', ['key' => self::TICK_LOCK_KEY]);
+            $this->db->delete('memhelper_meta', [
+                'key' => self::TICK_LOCK_KEY,
+                'value' => (string) getmypid()
+            ]);
         } catch (\Throwable) {
             // best effort — next tick will detect a stale row anyway.
         }
@@ -1535,7 +1537,7 @@ final class memhelper
             $slug = (string) $row['slug'];
             $body = (string) $row['body'];
             if (strlen($body) > $this->maxSourceBytes) {
-                $body = mb_substr($body, 0, $this->maxSourceBytes) . "\n\n[truncated]";
+                $body = mb_strcut($body, 0, $this->maxSourceBytes) . "\n\n[truncated]";
             }
             $idx = $i + 1;
             $label = (string) (self::slugToPath($slug) ?? $slug);
@@ -1554,7 +1556,8 @@ final class memhelper
                 [$diff, $raw] = $this->distillOne($label, $body);
             } catch (\Throwable $e) {
                 $this->log(sprintf('distill: [%d/%d] %s — ai failed: %s', $idx, $total, basename($label), $e->getMessage()), 'WARN');
-                if (str_contains(strtolower($e->getMessage()), 'context window')) {
+                $error = strtolower($e->getMessage());
+                if (str_contains($error, 'context window') || str_contains($error, 'prompt is too long')) {
                     $this->db->update(
                         'memhelper_state',
                         ['distilled_at' => time()],
@@ -1952,22 +1955,16 @@ final class memhelper
         return !empty($this->aiConfig['provider']) && !empty($this->aiConfig['model']);
     }
 
-    private function ai(): aihelper
-    {
-        if ($this->ai === null) {
-            $apiKey = (string) ($this->aiConfig['api_key'] ?? '');
-            $this->ai = aihelper::create(
-                provider: (string) $this->aiConfig['provider'],
-                model: (string) $this->aiConfig['model'],
-                api_key: $apiKey !== '' ? $apiKey : null
-            );
-        }
-        return $this->ai;
-    }
-
     private function callAi(string $prompt): string
     {
-        $result = $this->ai()->ask(prompt: $prompt);
+        $apiKey = (string) ($this->aiConfig['api_key'] ?? '');
+        $ai = aihelper::create(
+            provider: (string) $this->aiConfig['provider'],
+            model: (string) $this->aiConfig['model'],
+            api_key: $apiKey !== '' ? $apiKey : null,
+            max_tries: 3
+        );
+        $result = $ai->ask(prompt: $prompt);
         if (!($result['success'] ?? false)) {
             throw new RuntimeException('memhelper: aihelper call failed: ' . self::stringifyAiResponse($result['response'] ?? null));
         }
