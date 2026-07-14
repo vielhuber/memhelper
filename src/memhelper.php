@@ -1638,10 +1638,10 @@ final class memhelper
             "RULES:\n" .
             "  1. CROSS-LINK AGGRESSIVELY. Whenever an entry mentions an entity (person, project, account, household, contract, recurring concept), inline a `[[that-slug]]` reference to it. This applies BOTH to slugs already in the list above AND to slugs you are creating in THIS SAME response — list newly-added slugs first, then reference them from later entries. Cross-references are how related memories surface together at retrieval time. An entry without any `[[…]]` is almost always a missed opportunity unless the fact is genuinely standalone.\n" .
             "  2. When several entries share a recurring umbrella concept (e.g. \"household budget\", \"family\", \"vehicle fleet\", a specific contract suite), add ONE hub entry for the umbrella and link every related entry from it as `[[hub-slug]]` references inside the hub's content.\n" .
-            "  3. Extract EVERY concrete fact about people, things, preferences, projects, decisions, configurations. Be generous.\n" .
+            "  3. Apply a STRICT LONG-TERM VALUE GATE. Save only facts that are likely to remain useful across unrelated future conversations: identity, relationships, stable preferences, recurring obligations, durable project decisions, explicitly established rules and persistent configurations. Be conservative; if uncertain, return [].\n" .
             "  4. One fact = one entry. Split combined statements into separate entries.\n" .
             "  5. If the source mentions a fact that overlaps an existing slug → use action:\"update\" with the merged content.\n" .
-            "  6. Only return [] if the source is genuinely generic (a tutorial, raw transcript, news article with no personal/project content).\n" .
+            "  6. Return [] for one-off research results, individual vacancies or search hits, generated document contents, implementation progress, test/build results, logs, transient errors, temporary paths, current-run status, timestamps that only describe a run, and third-party facts unrelated to the user's durable context. A stable search preference may be memory; a specific result found during that search is not. A durable architecture decision may be memory; a file changed or test passed during its implementation is not.\n" .
             "  7. Write `content` and `description` in the LANGUAGE OF THE SOURCE. If the source mixes languages, use the dominant one. This keeps memory searchable in the user's own words. Tags stay lower-case English keywords regardless of source language.\n\n" .
             "WORKED EXAMPLE A — linking to a PRE-EXISTING slug (do NOT copy these into your output — they are illustrations only):\n" .
             "  Source content: \"Meine Katze heißt Mochi und ich nutze vim als Editor. Mochi mag meine Schwester Anna.\"\n" .
@@ -1698,13 +1698,14 @@ final class memhelper
         }
         $this->log(sprintf('compact: evaluating %d memory entries', count($blocks)));
         $prompt =
-            "You curate a long-term memory store for an LLM assistant. The current entries are listed below. Do four things:\n" .
-            "  1. DEDUPE + MERGE: identify duplicates, contradictions, obsolete facts — collapse overlapping entries into one canonical entry, drop anything no longer relevant.\n" .
-            "  2. ADD MISSING CROSS-REFERENCES: most entries below were created without `[[slug]]` links. Walk through them and, whenever an entry mentions an entity that already has its own slug (a person, project, contract, recurring concept, an umbrella like \"household budget\"), emit an `update` action whose `content` is the original body with `[[that-slug]]` inserted at the right places. If many entries clearly share an umbrella concept but no hub entry exists yet, ADD one and link all members to it (e.g. `household-budget` hub linking every recurring expense entry).\n" .
-            "  3. PRESERVE every existing `[[slug]]` cross-reference when rewriting bodies — those links power 1-hop expansion at retrieval time.\n" .
-            "  4. PRESERVE the original language of each entry — never translate.\n\n" .
+            "You curate a durable long-term memory store for an LLM assistant. The current entries are listed below. Do five things:\n" .
+            "  1. PURGE TRANSIENT DATA: emit `delete` for one-off research results, individual vacancies or search hits, generated document contents, implementation progress, test/build results, logs, transient errors, temporary paths and current-run status. Preserve stable preferences, recurring rules and durable decisions even when they originated in those conversations.\n" .
+            "  2. DEDUPE + MERGE: identify duplicates, contradictions and obsolete facts — collapse overlapping entries into one canonical entry and delete superseded entries.\n" .
+            "  3. ADD MISSING CROSS-REFERENCES: whenever an entry mentions an entity that already has its own slug, emit an `update` action whose `content` is the original body with `[[that-slug]]` inserted at the right places. If many entries clearly share an umbrella concept but no hub entry exists yet, add one and link all members from it.\n" .
+            "  4. PRESERVE every valid existing `[[slug]]` cross-reference when rewriting bodies — those links power 1-hop expansion at retrieval time.\n" .
+            "  5. PRESERVE the original language of each entry — never translate.\n\n" .
             implode("\n\n---\n\n", $blocks) .
-            "\n\nReturn a JSON array of actions using the same schema as the extract step (action, slug, content, description, tags). `tags` is a list of lower-case keyword strings — keep, narrow or extend the existing tag set when rewriting; do not invent unrelated tags. Respond with raw JSON only, no markdown fences.";
+            "\n\nReturn a JSON array of actions using the same schema as the extract step (action is add, update or delete; slug, content, description, tags). Delete actions only require action and slug. `tags` is a list of lower-case keyword strings — keep, narrow or extend the existing tag set when rewriting; do not invent unrelated tags. Respond with raw JSON only, no markdown fences.";
         $tStart = microtime(true);
         try {
             $raw = $this->callAi($prompt);
