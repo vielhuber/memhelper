@@ -34,6 +34,8 @@ input_dbs:
     - driver: sqlite
       path: /path/to/database.db
       include_tables: [chats_messages] # optional
+      where: # optional
+          chats_messages: role = 'user' AND status = 'completed'
 
     - driver: mysql
       host: 127.0.0.1

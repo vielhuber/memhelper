@@ -319,6 +319,40 @@ final class Test extends TestCase
         $this->assertSame('dbrow:external:chats_messages:1', $rows[0]['slug']);
     }
 
+    public function testInputDbsWhereFiltersRows(): void
+    {
+        $extDbPath = $this->tmpDir . '/external.db';
+        $ext = new \PDO('sqlite:' . $extDbPath);
+        $ext->exec('CREATE TABLE chats_messages (id INTEGER PRIMARY KEY, role TEXT, status TEXT, content TEXT)');
+        $ext->exec("INSERT INTO chats_messages (id, role, status, content) VALUES
+            (1, 'user', 'completed', 'Remember this.'),
+            (2, 'assistant', 'completed', 'Do not index this.'),
+            (3, 'user', 'streaming', 'Do not index this either.')
+        ");
+        unset($ext);
+
+        $this->cfgPath = $this->tmpDir . '/config.yaml';
+        file_put_contents($this->cfgPath, implode("\n", [
+            'output: ' . $this->tmpDir,
+            'input_dbs:',
+            '    - driver: sqlite',
+            '      path: ' . $extDbPath,
+            '      include_tables: [chats_messages]',
+            '      where:',
+            "          chats_messages: role = 'user' AND status = 'completed'",
+            ''
+        ]));
+        $this->mem()->work();
+
+        $pdo = new \PDO('sqlite:' . $this->tmpDir . '/.data/memhelper.db');
+        $rows = $pdo->query(
+            "SELECT slug, body FROM memhelper_state WHERE kind='source' AND slug LIKE 'dbrow:%' ORDER BY slug"
+        )->fetchAll(\PDO::FETCH_ASSOC);
+        $this->assertCount(1, $rows);
+        $this->assertSame('dbrow:external:chats_messages:1', $rows[0]['slug']);
+        $this->assertStringContainsString('Remember this.', $rows[0]['body']);
+    }
+
     public function testInputDbsExcludeTablesAddsToBlacklist(): void
     {
         $extDbPath = $this->tmpDir . '/external.db';

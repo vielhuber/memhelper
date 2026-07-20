@@ -1018,6 +1018,7 @@ final class memhelper
             $excludeTables = is_array($dbc['exclude_tables'] ?? null)
                 ? array_map('strtolower', array_map('strval', $dbc['exclude_tables']))
                 : [];
+            $tableFilters = is_array($dbc['where'] ?? null) ? $dbc['where'] : [];
             $processedTables = [];
             foreach ($tables as $t) {
                 $tn = $t['name'];
@@ -1038,10 +1039,23 @@ final class memhelper
                     $this->log("input_dbs[$alias:$tn]: skip — no single-column primary key");
                     continue;
                 }
-                if ($t['rowCount'] > self::DB_TABLE_ROW_CAP) {
+                $tableFilter = isset($tableFilters[$tn]) && is_string($tableFilters[$tn])
+                    ? trim($tableFilters[$tn])
+                    : null;
+                if ($tableFilter !== null && str_contains($tableFilter, ';')) {
+                    $this->log("input_dbs[$alias:$tn]: skip — where filter must not contain semicolons", 'WARN');
+                    continue;
+                }
+                $rowCount = $t['rowCount'];
+                if ($tableFilter !== null && $tableFilter !== '') {
+                    $rowCount = (int) ($source->fetch_var(
+                        sprintf('SELECT COUNT(*) FROM "%s" WHERE (%s)', $tn, $tableFilter)
+                    ) ?: 0);
+                }
+                if ($rowCount > self::DB_TABLE_ROW_CAP) {
                     $this->log(sprintf(
                         'input_dbs[%s:%s]: skip — %d rows > cap (%d)',
-                        $alias, $tn, $t['rowCount'], self::DB_TABLE_ROW_CAP
+                        $alias, $tn, $rowCount, self::DB_TABLE_ROW_CAP
                     ));
                     continue;
                 }
@@ -1051,7 +1065,14 @@ final class memhelper
                     continue;
                 }
                 try {
-                    $this->refreshDbTable($source, $alias, $tn, $t['pkName'], $contentCols);
+                    $this->refreshDbTable(
+                        $source,
+                        $alias,
+                        $tn,
+                        $t['pkName'],
+                        $contentCols,
+                        $tableFilter
+                    );
                     $processedTables[] = $tn;
                 } catch (\Throwable $e) {
                     $this->log(sprintf(
@@ -1372,7 +1393,8 @@ final class memhelper
         string $alias,
         string $table,
         string $pkCol,
-        array $contentCols
+        array $contentCols,
+        ?string $where = null
     ): void {
         $tStart = microtime(true);
 
@@ -1398,9 +1420,10 @@ final class memhelper
         $unchanged = 0;
 
         while (true) {
+            $whereSql = $where !== null && $where !== '' ? ' WHERE (' . $where . ')' : '';
             $rows = $source->fetch_all(
-                sprintf('SELECT %s FROM "%s" ORDER BY "%s" LIMIT %d OFFSET %d',
-                    $colList, $table, $pkCol, $batchSize, $offset)
+                sprintf('SELECT %s FROM "%s"%s ORDER BY "%s" LIMIT %d OFFSET %d',
+                    $colList, $table, $whereSql, $pkCol, $batchSize, $offset)
             ) ?: [];
             if ($rows === []) {
                 break;
@@ -1587,7 +1610,9 @@ final class memhelper
             // decoded or the provider replies in an unexpected shape.
             $this->log(
                 'distill: raw response: ' . $rawPreview . (mb_strlen($raw) > 300 ? '…' : ''),
-                $counts['add'] + $counts['update'] + $counts['delete'] === 0 ? 'WARN' : 'INFO'
+                trim($raw) === '[]' || $counts['add'] + $counts['update'] + $counts['delete'] > 0
+                    ? 'INFO'
+                    : 'WARN'
             );
             $this->applyDiff($diff, $slug);
             // mark as distilled regardless of action count — an empty diff is
