@@ -117,6 +117,33 @@ final class Test extends TestCase
         $this->assertSame('Charly is a multi-agent orchestrator built in php.', $row['body']);
     }
 
+    public function testDistillationWaitsDuringProviderCapacityPause(): void
+    {
+        $filesDir = $this->tmpDir . '/docs';
+        mkdir($filesDir);
+        file_put_contents($filesDir . '/notes.txt', 'This fact must remain pending.');
+        file_put_contents($this->cfgPath, implode("\n", [
+            'output: ' . $this->tmpDir,
+            'input_files:',
+            '    - ' . $filesDir,
+            'ai:',
+            '    provider: openai',
+            '    model: unavailable-test-model',
+            ''
+        ]));
+        $memory = $this->mem();
+        $pause = new \ReflectionProperty(memhelper::class, 'aiUnavailableUntil');
+        $pause->setValue($memory, time() + 300);
+
+        $memory->work();
+
+        $pdo = new \PDO('sqlite:' . $this->tmpDir . '/.data/memhelper.db');
+        $distilledAt = $pdo->query(
+            "SELECT distilled_at FROM memhelper_state WHERE kind = 'source' AND slug LIKE '%notes.txt'"
+        )->fetchColumn();
+        $this->assertNull($distilledAt);
+    }
+
     public function testCrossReferenceExpansionPullsLinkedNeighbour(): void
     {
         // a query that lexically matches only one entry should still surface

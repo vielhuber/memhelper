@@ -43,6 +43,7 @@ final class memhelper
     private ?string $logPath = null;
     private int $maxSourceBytes;
     private int $existingMemoryLimit;
+    private int $aiUnavailableUntil = 0;
 
     /**
      * The host may pass the absolute path of its memhelper yaml explicitly,
@@ -1542,6 +1543,9 @@ final class memhelper
             }
             return;
         }
+        if ($this->aiUnavailableUntil > time()) {
+            return;
+        }
         $sources = $this->db->fetch_all(
             "SELECT slug, body FROM memhelper_state
              WHERE kind = 'source' AND hash != ?
@@ -1586,6 +1590,16 @@ final class memhelper
                         ['distilled_at' => time()],
                         ['slug' => $slug]
                     );
+                }
+                if (
+                    str_contains($error, 'auth_unavailable') ||
+                    str_contains($error, 'cooling down') ||
+                    str_contains($error, 'usage limit has been reached') ||
+                    str_contains($error, 'would exceed your account\'s rate limit')
+                ) {
+                    $this->aiUnavailableUntil = time() + 300;
+                    $this->log('distill: paused because the configured ai provider has no available capacity', 'WARN');
+                    break;
                 }
                 continue;
             }
