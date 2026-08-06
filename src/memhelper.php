@@ -171,15 +171,15 @@ final class memhelper
 
     /**
      * Look up curated facts for a natural-language query. Tokenises the
-     * query, runs the fts5 search, expands hits by one hop along the
-     * `[[…]]` link graph and returns the matching memory entries as raw
-     * structured data (slug, tags, description, body, sources, score, via).
+     * query, ranks the fts5 candidates by the fused score, expands them by
+     * one hop along the `[[…]]` link graph and returns the matching memory
+     * entries as raw structured data. `score` is positive, higher = better.
      *
      * This is both the host-facing PHP method AND the MCP-exposed tool
      * (simplemcp's discovery picks the `#[McpTool]` attribute up directly,
      * so there is no separate wrapper class to keep in sync).
      *
-     * @return list<array{slug:string,tags:list<string>,description:string,body:string,sources:list<string>,score:float|null,via:string|null}>
+     * @return list<array{slug:string,tags:list<string>,description:string,body:string,sources:list<string>,score:float,via:string|null}>
      */
     #[McpTool(
         name: 'grab',
@@ -205,55 +205,25 @@ final class memhelper
             return [];
         }
         $hits = $this->search($query, $limit);
-        $primarySlugs = [];
-        foreach ($hits as $h) {
-            $slug = (string) ($h['slug'] ?? '');
-            if ($slug !== '') {
-                $primarySlugs[] = $slug;
-            }
-        }
-        $neighbours = $this->neighboursOf($primarySlugs, max(1, $limit));
+        $neighbours = $this->neighboursOf($hits, max(1, $limit));
 
         $results = [];
-        $seen = [];
-        foreach ($hits as $h) {
-            $slug = (string) ($h['slug'] ?? '');
-            if ($slug === '' || isset($seen[$slug])) {
-                continue;
+        foreach ([[$hits, null], [$neighbours, 'link']] as [$candidates, $via]) {
+            foreach ($candidates as $slug => $score) {
+                $entry = $this->getMemory($slug);
+                if ($entry === null || self::isExpired($entry['frontmatter'])) {
+                    continue;
+                }
+                $results[] = [
+                    'slug' => $slug,
+                    'tags' => self::readTags($entry['frontmatter']),
+                    'description' => (string) ($entry['frontmatter']['description'] ?? ''),
+                    'body' => trim((string) $entry['body']),
+                    'sources' => self::readSources($entry['frontmatter']),
+                    'score' => round($score, 4),
+                    'via' => $via
+                ];
             }
-            $entry = $this->getMemory($slug);
-            if ($entry === null) {
-                continue;
-            }
-            $seen[$slug] = true;
-            $results[] = [
-                'slug' => $slug,
-                'tags' => self::readTags($entry['frontmatter']),
-                'description' => (string) ($entry['frontmatter']['description'] ?? ''),
-                'body' => trim((string) $entry['body']),
-                'sources' => self::readSources($entry['frontmatter']),
-                'score' => isset($h['score']) ? (float) $h['score'] : null,
-                'via' => null
-            ];
-        }
-        foreach ($neighbours as $slug) {
-            if (isset($seen[$slug])) {
-                continue;
-            }
-            $entry = $this->getMemory($slug);
-            if ($entry === null) {
-                continue;
-            }
-            $seen[$slug] = true;
-            $results[] = [
-                'slug' => $slug,
-                'tags' => self::readTags($entry['frontmatter']),
-                'description' => (string) ($entry['frontmatter']['description'] ?? ''),
-                'body' => trim((string) $entry['body']),
-                'sources' => self::readSources($entry['frontmatter']),
-                'score' => null,
-                'via' => 'link'
-            ];
         }
         $this->log(sprintf(
             'grab: query=%dB hits=%d neighbours=%d returned=%d',
@@ -291,7 +261,9 @@ final class memhelper
             $this->distillSources();
             // phase 3: sync the curated md files into the fts5 search index
             $this->refreshMemoryIndex();
-            // phase 4: periodic compaction
+            // phase 4: drop entries whose valid_until has passed
+            $this->expireMemories();
+            // phase 5: periodic compaction
             if ($this->shouldCompact()) {
                 $this->log('compaction is due (last run > 24 h ago)');
                 $this->compact();
@@ -392,45 +364,82 @@ final class memhelper
     // ====================================================================
 
     /**
-     * Return up to `$maxAdd` slugs reachable from any of `$primarySlugs` via
-     * one hop in the link graph (either direction). The cap keeps the
-     * returned fact set bounded when an entry is heavily cross-referenced.
+     * Rank the slugs reachable from `$primaryScores` via one hop in the link
+     * graph (either direction) and return the best `$maxAdd` as slug => score.
+     * A neighbour inherits a damped share of the strongest primary that
+     * references it, with a small bonus per additional referencing primary —
+     * without that ordering a hub with 30 edges would contribute an arbitrary
+     * handful of them.
+     *
+     * @param array<string, float> $primaryScores
+     * @return array<string, float>
      */
-    private function neighboursOf(array $primarySlugs, int $maxAdd): array
+    private function neighboursOf(array $primaryScores, int $maxAdd): array
     {
-        if ($primarySlugs === [] || $maxAdd <= 0) {
+        if ($primaryScores === [] || $maxAdd <= 0) {
             return [];
         }
+        $primarySlugs = array_keys($primaryScores);
         $placeholders = implode(',', array_fill(0, count($primarySlugs), '?'));
         try {
             $rows = $this->db->fetch_all(
-                "SELECT to_slug AS slug FROM memhelper_links WHERE from_slug IN ($placeholders)
-                 UNION
-                 SELECT from_slug AS slug FROM memhelper_links WHERE to_slug IN ($placeholders)",
+                "SELECT from_slug, to_slug FROM memhelper_links
+                 WHERE from_slug IN ($placeholders) OR to_slug IN ($placeholders)",
                 ...array_merge($primarySlugs, $primarySlugs)
             ) ?: [];
         } catch (\Throwable) {
             return [];
         }
-        $primary = array_flip($primarySlugs);
-        $out = [];
+        $best = [];
+        $refs = [];
         foreach ($rows as $r) {
-            $s = (string) ($r['slug'] ?? '');
-            if ($s === '' || isset($primary[$s])) {
-                continue;
-            }
-            $out[$s] = true;
-            if (count($out) >= $maxAdd) {
-                break;
+            $from = (string) ($r['from_slug'] ?? '');
+            $to = (string) ($r['to_slug'] ?? '');
+            foreach ([[$from, $to], [$to, $from]] as [$anchor, $neighbour]) {
+                if (!isset($primaryScores[$anchor]) || $neighbour === '' || isset($primaryScores[$neighbour])) {
+                    continue;
+                }
+                $best[$neighbour] = max($best[$neighbour] ?? 0.0, $primaryScores[$anchor]);
+                $refs[$neighbour] = ($refs[$neighbour] ?? 0) + 1;
             }
         }
-        return array_keys($out);
+        $scored = [];
+        foreach ($best as $slug => $score) {
+            $scored[$slug] = $score * self::NEIGHBOUR_DAMPING * (1.0 + 0.1 * ($refs[$slug] - 1));
+        }
+        arsort($scored);
+        return array_slice($scored, 0, $maxAdd, true);
     }
 
     // ====================================================================
     //  Internal — search across all configured DBs
     // ====================================================================
 
+    /**
+     * Column weights for bm25 — description and tags outrank plain body text
+     * because both are deliberately curated, the body is prose. The zeros are
+     * the UNINDEXED columns; bm25 still expects one weight per column.
+     */
+    private const BM25_WEIGHTS = '0.0, 0.0, 3.0, 1.0, 2.0, 0.0, 0.0';
+    private const SCORE_WEIGHT_LINKS = 0.15;
+    private const SCORE_WEIGHT_RECENCY = 0.15;
+    /** Well-connected entries are hubs — cap the boost so a mega-hub cannot
+     *  outrank a direct textual match on its own. */
+    private const LINK_DEGREE_SATURATION = 8;
+    /** Long enough that durable facts barely decay — recency breaks ties, it
+     *  does not drive the ranking. */
+    private const RECENCY_HALFLIFE_SECONDS = 7776000;
+    private const NEIGHBOUR_DAMPING = 0.4;
+    private const CANDIDATE_POOL_FACTOR = 5;
+    private const CANDIDATE_POOL_MIN = 50;
+
+    /**
+     * Fetch a candidate pool by bm25, then rerank it by fusing three signals
+     * into one positive score (higher = better): textual relevance, link
+     * degree and recency. Expired entries never enter the pool.
+     *
+     * @return array<string, float> slug => score, best first
+     */
     private function search(string $q, int $limit): array
     {
         $limit = max(1, $limit);
@@ -438,20 +447,86 @@ final class memhelper
         if ($tokens === []) {
             return [];
         }
+        $pool = max(self::CANDIDATE_POOL_MIN, $limit * self::CANDIDATE_POOL_FACTOR);
         try {
-            // sqlite bm25 returns negative scores (smaller = better) — keep as
-            // returned, the ORDER BY ASC takes care of ranking.
-            return $this->db->fetch_all(
-                'SELECT slug, kind, title, snippet(memories, 3, "[", "]", "…", 12) AS snippet, bm25(memories) AS score
-                 FROM memories WHERE memories MATCH ? ORDER BY score LIMIT ?',
+            $rows = $this->db->fetch_all(
+                'SELECT slug, updated, bm25(memories, ' . self::BM25_WEIGHTS . ') AS rank
+                 FROM memories
+                 WHERE memories MATCH ? AND (valid_until = ? OR valid_until >= ?)
+                 ORDER BY rank LIMIT ?',
                 implode(' OR ', $tokens),
-                $limit
+                '',
+                date('Y-m-d'),
+                $pool
             ) ?: [];
         } catch (\Throwable) {
             // malformed full-text query (e.g. unbalanced fts5 boolean) just
             // means "no hits"; don't blow up the whole prompt assembly.
             return [];
         }
+        if ($rows === []) {
+            return [];
+        }
+        // bm25 is negative and unbounded (smaller = better) — normalise against
+        // the strongest hit so relevance lands in (0,1] and the additive
+        // boosts below stay comparable across queries.
+        $bestRank = 0.0;
+        foreach ($rows as $r) {
+            $bestRank = min($bestRank, (float) $r['rank']);
+        }
+        if ($bestRank === 0.0) {
+            $bestRank = -1.0;
+        }
+        $degrees = $this->linkDegrees(array_map(static fn(array $r): string => (string) $r['slug'], $rows));
+        $now = time();
+        $scored = [];
+        foreach ($rows as $r) {
+            $slug = (string) $r['slug'];
+            $relevance = (float) $r['rank'] / $bestRank;
+            $degree = $degrees[$slug] ?? 0;
+            $linkBoost = log(1 + $degree) / log(1 + self::LINK_DEGREE_SATURATION);
+            $updated = (int) ($r['updated'] ?? 0);
+            $recencyBoost = $updated > 0
+                ? 2 ** (-max(0, $now - $updated) / self::RECENCY_HALFLIFE_SECONDS)
+                : 0.0;
+            $scored[$slug] =
+                $relevance +
+                self::SCORE_WEIGHT_LINKS * min(1.0, $linkBoost) +
+                self::SCORE_WEIGHT_RECENCY * $recencyBoost;
+        }
+        arsort($scored);
+        return array_slice($scored, 0, $limit, true);
+    }
+
+    /**
+     * Combined in+out degree in the link graph for the given slugs.
+     *
+     * @param list<string> $slugs
+     * @return array<string, int>
+     */
+    private function linkDegrees(array $slugs): array
+    {
+        if ($slugs === []) {
+            return [];
+        }
+        $placeholders = implode(',', array_fill(0, count($slugs), '?'));
+        try {
+            $rows = $this->db->fetch_all(
+                "SELECT slug, COUNT(*) AS degree FROM (
+                     SELECT from_slug AS slug FROM memhelper_links WHERE from_slug IN ($placeholders)
+                     UNION ALL
+                     SELECT to_slug AS slug FROM memhelper_links WHERE to_slug IN ($placeholders)
+                 ) GROUP BY slug",
+                ...array_merge($slugs, $slugs)
+            ) ?: [];
+        } catch (\Throwable) {
+            return [];
+        }
+        $out = [];
+        foreach ($rows as $r) {
+            $out[(string) $r['slug']] = (int) $r['degree'];
+        }
+        return $out;
     }
 
     /**
@@ -488,10 +563,11 @@ final class memhelper
 
     private function initSchemaSqlite(dbhelper $db): void
     {
-        // detect schema drift (older deployments missing kind/body/distilled_at
-        // or the meta table) and drop — derived state, cheap to redo from disk.
+        // hard reset — the bookkeeping tables lost columns an older layout did
+        // not have. this also drops the staged source bodies, so every source
+        // gets re-extracted AND re-distilled (expensive, ai calls). only used
+        // for drift the additive path below cannot repair.
         try {
-            $db->fetch_var('SELECT kind FROM memories LIMIT 0');
             $db->fetch_var('SELECT body, distilled_at FROM memhelper_state LIMIT 0');
             $db->fetch_var('SELECT value, updated_at FROM memhelper_meta LIMIT 0');
         } catch (\Throwable) {
@@ -500,12 +576,6 @@ final class memhelper
             $db->query('DROP TABLE IF EXISTS memhelper_state');
             $db->query('DROP TABLE IF EXISTS memhelper_links');
         }
-        // memories: ONLY curated md entries (kind='memory'). sources never
-        // land here — they are read by the ai during distillation, then the
-        // resulting memory entries get indexed.
-        $db->query(
-            'CREATE VIRTUAL TABLE IF NOT EXISTS memories USING fts5(slug UNINDEXED, kind UNINDEXED, title, body, tokenize="unicode61 remove_diacritics 2")'
-        );
         // memhelper_state: bookkeeping for every tracked artefact.
         //   kind='memory' — a curated md in output/, mirrors a memories row.
         //   kind='source' — a raw input (file or db row); body holds the
@@ -548,26 +618,73 @@ final class memhelper
             )'
         );
         $db->query('CREATE INDEX IF NOT EXISTS memhelper_links_to ON memhelper_links(to_slug)');
+        // memories: ONLY curated md entries (kind='memory'). sources never
+        // land here — they are read by the ai during distillation, then the
+        // resulting memory entries get indexed. `tags` is indexed so a tag
+        // matches the query like body text does; `updated` (unix) and
+        // `valid_until` (Y-m-d, empty = never expires) only ride along for
+        // ranking and the expiry sweep.
+        //
+        // soft reset — this table is derived from output/*.md alone, so a
+        // layout change costs nothing but a re-read from disk. dropping the
+        // matching state rows is what makes refreshMemoryIndex() rebuild
+        // them; source rows keep their bodies and their distilled_at.
+        try {
+            $db->fetch_var('SELECT tags, updated, valid_until FROM memories LIMIT 0');
+        } catch (\Throwable) {
+            $db->query('DROP TABLE IF EXISTS memories');
+            try {
+                $db->delete('memhelper_state', ['kind' => 'memory']);
+            } catch (\Throwable) {
+                // table may not exist yet on a fresh install — nothing to clear.
+            }
+        }
+        $db->query(
+            'CREATE VIRTUAL TABLE IF NOT EXISTS memories USING fts5(slug UNINDEXED, kind UNINDEXED, title, body, tags, updated UNINDEXED, valid_until UNINDEXED, tokenize="unicode61 remove_diacritics 2")'
+        );
     }
 
-    private function writeEntry(string $slug, string $kind, string $title, string $body, int $mtime): void
+    /**
+     * @param array<string, mixed> $frontmatter the entry's parsed frontmatter;
+     *   supplies tags, `updated` and `valid_until` for the index columns.
+     */
+    private function writeEntry(string $slug, string $kind, string $title, string $body, int $mtime, array $frontmatter = []): void
     {
         $this->db->delete('memories', ['slug' => $slug]);
         $this->db->insert('memories', [
             'slug' => $slug,
             'kind' => $kind,
             'title' => $title,
-            'body' => $body
+            'body' => $body,
+            'tags' => implode(' ', self::readTags($frontmatter)),
+            'updated' => (string) self::readUpdated($frontmatter, $mtime),
+            'valid_until' => self::readValidUntil($frontmatter)
         ]);
         $this->db->delete('memhelper_state', ['slug' => $slug]);
         $this->db->insert('memhelper_state', [
             'slug' => $slug,
             'kind' => $kind,
             'mtime' => $mtime,
-            'hash' => sha1($body),
+            'hash' => self::memoryHash($frontmatter, $body),
             'indexed_at' => time()
         ]);
         $this->upsertLinks($slug, $body);
+    }
+
+    /**
+     * Change detection for a curated entry. Covers the indexed frontmatter
+     * fields as well as the body — hashing the body alone would let a
+     * hand-edited `valid_until` or tag list slip past the mtime-only fast
+     * path and never reach the index.
+     */
+    private static function memoryHash(array $frontmatter, string $body): string
+    {
+        return sha1(implode("\0", [
+            $body,
+            (string) ($frontmatter['description'] ?? ''),
+            implode(',', self::readTags($frontmatter)),
+            self::readValidUntil($frontmatter)
+        ]));
     }
 
     private function removeEntry(string $slug): void
@@ -772,7 +889,7 @@ final class memhelper
             $info = $desired[$slug];
             $raw = (string) file_get_contents($info['path']);
             [$fm, $body] = self::splitFrontmatter($raw);
-            $this->writeEntry($slug, 'memory', (string) ($fm['description'] ?? ''), $body, $info['mtime']);
+            $this->writeEntry($slug, 'memory', (string) ($fm['description'] ?? ''), $body, $info['mtime'], $fm);
             $done++;
             $this->progress($tag, $done, $total, "added $slug");
         }
@@ -780,7 +897,7 @@ final class memhelper
             $info = $desired[$slug];
             $raw = (string) file_get_contents($info['path']);
             [$fm, $body] = self::splitFrontmatter($raw);
-            $hash = sha1($body);
+            $hash = self::memoryHash($fm, $body);
             if ($hash === $current[$slug]['hash']) {
                 $this->db->update(
                     'memhelper_state',
@@ -791,7 +908,7 @@ final class memhelper
                 $this->progress($tag, $done, $total, "touched $slug (mtime-only)");
                 continue;
             }
-            $this->writeEntry($slug, 'memory', (string) ($fm['description'] ?? ''), $body, $info['mtime']);
+            $this->writeEntry($slug, 'memory', (string) ($fm['description'] ?? ''), $body, $info['mtime'], $fm);
             $done++;
             $this->progress($tag, $done, $total, "updated $slug");
         }
@@ -1557,39 +1674,37 @@ final class memhelper
             $this->log('distill: no pending sources');
             return;
         }
-        $this->log('distill: ' . count($sources) . ' pending source(s)');
+        $queue = $this->batchSources($sources);
+        $this->log(sprintf('distill: %d pending source(s) in %d batch(es)', count($sources), count($queue)));
         $tStart = microtime(true);
-        $total = count($sources);
-        foreach ($sources as $i => $row) {
-            $slug = (string) $row['slug'];
-            $body = (string) $row['body'];
-            if (strlen($body) > $this->maxSourceBytes) {
-                $body = mb_strcut($body, 0, $this->maxSourceBytes) . "\n\n[truncated]";
-            }
-            $idx = $i + 1;
-            $label = (string) (self::slugToPath($slug) ?? $slug);
-            // body preview so we can confirm the right content reaches the ai
-            $bodyPreview = str_replace(
-                ["\r", "\n"],
-                ['', ' ⏎ '],
-                mb_substr($body, 0, 200)
-            );
+        $batchNo = 0;
+        while ($queue !== []) {
+            $batch = array_shift($queue);
+            $batchNo++;
+            $bytes = array_sum(array_map(static fn(array $i): int => strlen($i['body']), $batch));
+            $names = array_map(static fn(array $i): string => basename($i['label']), $batch);
             $this->log(sprintf(
-                'distill: [%d/%d] %s — sending %d bytes to ai (preview: %s%s)',
-                $idx, $total, basename($label), strlen($body), $bodyPreview,
-                mb_strlen($body) > 200 ? '…' : ''
+                'distill: batch %d (%d queued) — %d source(s), %d bytes: %s%s',
+                $batchNo, count($queue), count($batch), $bytes,
+                implode(', ', array_slice($names, 0, 5)),
+                count($names) > 5 ? ', …' : ''
             ));
             try {
-                [$diff, $raw] = $this->distillOne($label, $body);
+                [$diff, $raw] = $this->distillBatch($batch);
             } catch (\Throwable $e) {
-                $this->log(sprintf('distill: [%d/%d] %s — ai failed: %s', $idx, $total, basename($label), $e->getMessage()), 'WARN');
+                $this->log(sprintf('distill: batch %d — ai failed: %s', $batchNo, $e->getMessage()), 'WARN');
                 $error = strtolower($e->getMessage());
                 if (str_contains($error, 'context window') || str_contains($error, 'prompt is too long')) {
-                    $this->db->update(
-                        'memhelper_state',
-                        ['distilled_at' => time()],
-                        ['slug' => $slug]
-                    );
+                    // a multi-source batch that overflows is worth retrying in
+                    // halves; a single source that overflows on its own never
+                    // will, so retire it instead of looping on it forever.
+                    if (count($batch) > 1) {
+                        $half = (int) ceil(count($batch) / 2);
+                        array_unshift($queue, array_slice($batch, 0, $half), array_slice($batch, $half));
+                        $this->log(sprintf('distill: batch %d split into halves and requeued', $batchNo));
+                        continue;
+                    }
+                    $this->markDistilled($batch);
                 }
                 if (
                     str_contains($error, 'auth_unavailable') ||
@@ -1614,9 +1729,8 @@ final class memhelper
                 mb_substr($raw, 0, 300)
             );
             $this->log(sprintf(
-                'distill: [%d/%d] %s — ai returned %d bytes, decoded %d action(s) — add=%d update=%d delete=%d skip=%d',
-                $idx, $total, basename($label),
-                strlen($raw), count($diff),
+                'distill: batch %d — ai returned %d bytes, decoded %d action(s) — add=%d update=%d delete=%d skip=%d',
+                $batchNo, strlen($raw), count($diff),
                 $counts['add'], $counts['update'], $counts['delete'], $counts['skip']
             ));
             // always log the raw response (truncated) so the operator can see
@@ -1628,28 +1742,75 @@ final class memhelper
                     ? 'INFO'
                     : 'WARN'
             );
-            $this->applyDiff($diff, $slug);
+            $this->applyDiff($diff, array_column($batch, 'slug'));
             // mark as distilled regardless of action count — an empty diff is
             // a valid answer ("nothing in this source is worth saving") and
             // shouldn't keep coming back to the ai on every tick.
-            $this->db->update(
-                'memhelper_state',
-                ['distilled_at' => time()],
-                ['slug' => $slug]
-            );
-            $this->progress('distill', $idx, $total, basename($label));
+            $this->markDistilled($batch);
         }
         $this->log(sprintf('distill: complete in %.2fs', microtime(true) - $tStart));
     }
 
+    /** @param list<array{slug:string,label:string,body:string}> $batch */
+    private function markDistilled(array $batch): void
+    {
+        foreach ($batch as $item) {
+            $this->db->update('memhelper_state', ['distilled_at' => time()], ['slug' => $item['slug']]);
+        }
+    }
+
+    private const DISTILL_BATCH_MAX_ITEMS = 25;
+
     /**
-     * Single-source distillation — sends body to the ai and returns a tuple
-     * of the decoded diff array AND the raw ai response (for diagnostic
-     * logging by the caller). Encapsulated so distillSources stays readable.
+     * Pack pending source rows into ai-sized batches. Rows arrive ordered by
+     * indexed_at, which already groups rows of the same table together, so
+     * sequential packing keeps a batch topically coherent without any extra
+     * grouping logic.
      *
+     * @param list<array<string, mixed>> $rows
+     * @return list<list<array{slug:string,label:string,body:string}>>
+     */
+    private function batchSources(array $rows): array
+    {
+        $batches = [];
+        $batch = [];
+        $bytes = 0;
+        foreach ($rows as $row) {
+            $body = (string) $row['body'];
+            if (strlen($body) > $this->maxSourceBytes) {
+                $body = mb_strcut($body, 0, $this->maxSourceBytes) . "\n\n[truncated]";
+            }
+            if (
+                $batch !== [] &&
+                ($bytes + strlen($body) > $this->maxSourceBytes || count($batch) >= self::DISTILL_BATCH_MAX_ITEMS)
+            ) {
+                $batches[] = $batch;
+                $batch = [];
+                $bytes = 0;
+            }
+            $slug = (string) $row['slug'];
+            $batch[] = [
+                'slug' => $slug,
+                'label' => (string) (self::slugToPath($slug) ?? $slug),
+                'body' => $body
+            ];
+            $bytes += strlen($body);
+        }
+        if ($batch !== []) {
+            $batches[] = $batch;
+        }
+        return $batches;
+    }
+
+    /**
+     * Batch distillation — sends every source body of one batch in a single
+     * prompt and returns a tuple of the decoded diff array AND the raw ai
+     * response (for diagnostic logging by the caller).
+     *
+     * @param list<array{slug:string,label:string,body:string}> $batch
      * @return array{0: list<array<string, mixed>>, 1: string}
      */
-    private function distillOne(string $label, string $body): array
+    private function distillBatch(array $batch): array
     {
         $existing = array_slice($this->listMemories(), 0, $this->existingMemoryLimit);
         $indexLines = array_map(
@@ -1659,17 +1820,25 @@ final class memhelper
             },
             $existing
         );
+        $sourceBlocks = [];
+        foreach ($batch as $i => $item) {
+            $n = $i + 1;
+            $sourceBlocks[] =
+                "---BEGIN SOURCE {$n}: " . $item['label'] . "---\n" .
+                $item['body'] . "\n" .
+                "---END SOURCE {$n}---";
+        }
         $prompt =
-            "TASK: Extract durable facts from the source document below into a memory store.\n\n" .
-            "Source: " . $label . "\n" .
-            "---BEGIN SOURCE---\n" .
-            $body . "\n" .
-            "---END SOURCE---\n\n" .
+            "TASK: Extract durable facts from the " . count($batch) . " source document(s) below into a memory store.\n\n" .
+            implode("\n\n", $sourceBlocks) .
+            "\n\n" .
             "Existing memory slugs:\n" .
             ($indexLines === [] ? '(none yet)' : implode("\n", $indexLines)) .
             "\n\n" .
-            "OUTPUT: Reply with a JSON array — nothing before or after, no markdown fences. Each item has:\n" .
+            "OUTPUT: Reply with a JSON array — nothing before or after, no markdown fences. Facts from all sources go into ONE array; merge freely across sources when they describe the same thing. Each item has:\n" .
             "  - action: \"add\" or \"update\"\n" .
+            "  - source: the number of the SOURCE block this fact came from (omit when it draws on several)\n" .
+            "  - valid_until: OPTIONAL `YYYY-MM-DD` — only when the fact has a KNOWN end date (a contract running out, a temporary arrangement, a booking). Omit it for facts that stay true indefinitely; never guess a date.\n" .
             "  - slug: kebab-case identifier — ALWAYS lower-case **English** keywords regardless of source language. Slugs are stable identifiers in a single namespace; mixing languages (`pets-of-household` next to `meinung-friseur-donauwelle`) produces near-duplicates that never cluster. Use English even when content/description stay in the source language.\n" .
             "  - content: the memory body, written in third person\n" .
             "  - description: a one-line summary\n" .
@@ -1705,7 +1874,7 @@ final class memhelper
             "    {\"action\":\"add\",\"slug\":\"food-hellofresh\",\"content\":\"Der User nutzt HelloFresh. Im [[household-budget]] sind 165,96€ monatlich angesetzt.\",\"description\":\"...\",\"tags\":[\"contract\",\"food\",\"subscription\",\"monthly\"]},\n" .
             "    {\"action\":\"add\",\"slug\":\"household-budget\",\"content\":\"Das Haushaltsbuch des Users umfasst u.a. [[hosting-all-inkl]], [[internet-vodafone]], [[food-hellofresh]].\",\"description\":\"Haushaltsbuch-Übersicht\",\"tags\":[\"budget\",\"household\",\"hub\"]}\n" .
             "  ]\n\n" .
-            "NOW process the source above and return the JSON array.";
+            "NOW process every source above and return one combined JSON array.";
         $raw = $this->callAi($prompt);
         return [self::decodeDiff($raw), $raw];
     }
@@ -1714,47 +1883,221 @@ final class memhelper
     //  Internal — compaction (LLM-driven)
     // ====================================================================
 
+    /** Prompt budget per compaction call. Well below any modern context
+     *  window — the point is that the pass survives a growing store, not that
+     *  it squeezes the maximum into one request. */
+    private const COMPACT_BATCH_BYTES = 60000;
+
+    /**
+     * Two-stage compaction. Stage one walks topical clusters (entries joined
+     * by a `[[link]]` or a shared tag) with full bodies, so duplicates and
+     * contradictions are compared against their actual neighbours. Stage two
+     * sweeps the whole store once with slugs + descriptions only, which is
+     * cheap enough to stay a single call at any size and catches what the
+     * cluster split cannot see.
+     */
     private function compact(): void
     {
         if (!$this->aiAvailable()) {
             $this->log('compact: ai not configured — skipping', 'WARN');
             return;
         }
-        $blocks = [];
-        foreach (glob($this->output . '/*.md') ?: [] as $file) {
-            $raw = (string) file_get_contents($file);
-            [$fm, $body] = self::splitFrontmatter($raw);
-            $tags = self::readTags($fm);
-            $blocks[] =
-                '## ' . basename($file, '.md') .
-                ($tags === [] ? '' : ' (tags: ' . implode(', ', $tags) . ')') .
-                "\nDescription: " . ($fm['description'] ?? '') .
-                "\n\n" . trim($body);
-        }
-        if ($blocks === []) {
+        $entries = $this->loadMemoryEntries();
+        if ($entries === []) {
             $this->log('compact: no memory files to evaluate');
             return;
         }
-        $this->log(sprintf('compact: evaluating %d memory entries', count($blocks)));
+        $batches = $this->clusterMemories($entries);
+        $this->log(sprintf(
+            'compact: evaluating %d memory entries in %d cluster batch(es)',
+            count($entries), count($batches)
+        ));
+        $stamp = 'compact:' . date('c');
+        foreach ($batches as $i => $batch) {
+            $blocks = array_map(
+                static function (array $e): string {
+                    return '## ' . $e['slug'] .
+                        ($e['tags'] === [] ? '' : ' (tags: ' . implode(', ', $e['tags']) . ')') .
+                        "\nDescription: " . $e['description'] .
+                        "\n\n" . $e['body'];
+                },
+                $batch
+            );
+            $prompt =
+                "You curate a durable long-term memory store for an LLM assistant. Below is one topical cluster of the store. Do five things:\n" .
+                "  1. PURGE TRANSIENT DATA: emit `delete` for one-off research results, individual vacancies or search hits, generated document contents, implementation progress, test/build results, logs, transient errors, temporary paths and current-run status. Preserve stable preferences, recurring rules and durable decisions even when they originated in those conversations.\n" .
+                "  2. DEDUPE + MERGE: identify duplicates, contradictions and obsolete facts — collapse overlapping entries into one canonical entry and delete superseded entries.\n" .
+                "  3. ADD MISSING CROSS-REFERENCES: whenever an entry mentions an entity that already has its own slug, emit an `update` action whose `content` is the original body with `[[that-slug]]` inserted at the right places. If many entries clearly share an umbrella concept but no hub entry exists yet, add one and link all members from it.\n" .
+                "  4. PRESERVE every valid existing `[[slug]]` cross-reference when rewriting bodies — those links power 1-hop expansion at retrieval time. Slugs outside this cluster still exist; never delete a `[[…]]` just because its target is not shown here.\n" .
+                "  5. PRESERVE the original language of each entry — never translate.\n\n" .
+                implode("\n\n---\n\n", $blocks) .
+                "\n\nReturn a JSON array of actions using the same schema as the extract step (action is add, update or delete; slug, content, description, tags, optional valid_until). Only act on the entries shown above. Delete actions only require action and slug. `tags` is a list of lower-case keyword strings — keep, narrow or extend the existing tag set when rewriting; do not invent unrelated tags. Respond with raw JSON only, no markdown fences.";
+            $tStart = microtime(true);
+            try {
+                $raw = $this->callAi($prompt);
+            } catch (\Throwable $e) {
+                $this->log(sprintf('compact: cluster batch %d ai call failed — %s', $i + 1, $e->getMessage()), 'ERROR');
+                continue;
+            }
+            $diff = self::decodeDiff($raw);
+            $this->log(sprintf(
+                'compact: cluster batch %d/%d (%d entries) responded in %.2fs, decoded %d action(s)',
+                $i + 1, count($batches), count($batch), microtime(true) - $tStart, count($diff)
+            ));
+            $this->applyDiff($diff, [$stamp]);
+        }
+        $this->compactHubPass($stamp);
+    }
+
+    /**
+     * Store-wide pass over slugs, descriptions and tags only. It never sees a
+     * body, so it may only retire entries or introduce a hub — every write to
+     * an existing entry is rejected by applyDiff().
+     */
+    private function compactHubPass(string $stamp): void
+    {
+        $entries = $this->loadMemoryEntries();
+        if ($entries === []) {
+            return;
+        }
+        $indexLines = array_map(
+            static function (array $e): string {
+                return '- ' . $e['slug'] .
+                    ($e['tags'] === [] ? '' : ' [' . implode(', ', $e['tags']) . ']') .
+                    ': ' . $e['description'];
+            },
+            $entries
+        );
         $prompt =
-            "You curate a durable long-term memory store for an LLM assistant. The current entries are listed below. Do five things:\n" .
-            "  1. PURGE TRANSIENT DATA: emit `delete` for one-off research results, individual vacancies or search hits, generated document contents, implementation progress, test/build results, logs, transient errors, temporary paths and current-run status. Preserve stable preferences, recurring rules and durable decisions even when they originated in those conversations.\n" .
-            "  2. DEDUPE + MERGE: identify duplicates, contradictions and obsolete facts — collapse overlapping entries into one canonical entry and delete superseded entries.\n" .
-            "  3. ADD MISSING CROSS-REFERENCES: whenever an entry mentions an entity that already has its own slug, emit an `update` action whose `content` is the original body with `[[that-slug]]` inserted at the right places. If many entries clearly share an umbrella concept but no hub entry exists yet, add one and link all members from it.\n" .
-            "  4. PRESERVE every valid existing `[[slug]]` cross-reference when rewriting bodies — those links power 1-hop expansion at retrieval time.\n" .
-            "  5. PRESERVE the original language of each entry — never translate.\n\n" .
-            implode("\n\n---\n\n", $blocks) .
-            "\n\nReturn a JSON array of actions using the same schema as the extract step (action is add, update or delete; slug, content, description, tags). Delete actions only require action and slug. `tags` is a list of lower-case keyword strings — keep, narrow or extend the existing tag set when rewriting; do not invent unrelated tags. Respond with raw JSON only, no markdown fences.";
+            "Below is the complete index of a long-term memory store — one line per entry, as `slug [tags]: description`. The bodies are NOT shown. Do exactly two things:\n" .
+            "  1. DELETE: emit `delete` for entries that are clearly transient and do not belong in a durable store — one-off research results, individual search hits, generated document contents, implementation progress, test/build results, logs, transient errors, temporary paths, current-run status. Only when the slug and description make this unambiguous; when in doubt, leave the entry alone.\n" .
+            "  2. ADD HUBS: when many entries clearly share an umbrella concept (a household, a family, a project, a contract suite, a vehicle fleet) and no hub entry exists for it yet, add ONE hub entry whose content links every member as `[[member-slug]]`. Only reference slugs from the list.\n\n" .
+            "You must NOT rewrite existing entries — you cannot see their bodies. `update` actions and `add` actions for an existing slug will be rejected.\n\n" .
+            implode("\n", $indexLines) .
+            "\n\nReturn a JSON array of actions (action is add or delete; slug, content, description, tags). Delete actions only require action and slug. Return [] when nothing needs doing. Respond with raw JSON only, no markdown fences.";
         $tStart = microtime(true);
         try {
             $raw = $this->callAi($prompt);
         } catch (\Throwable $e) {
-            $this->log('compact: ai call failed — ' . $e->getMessage(), 'ERROR');
+            $this->log('compact: hub pass ai call failed — ' . $e->getMessage(), 'ERROR');
             return;
         }
         $diff = self::decodeDiff($raw);
-        $this->log(sprintf('compact: ai responded in %.2fs, decoded %d action(s)', microtime(true) - $tStart, count($diff)));
-        $this->applyDiff($diff, 'compact:' . date('c'));
+        $this->log(sprintf(
+            'compact: hub pass over %d entries responded in %.2fs, decoded %d action(s)',
+            count($entries), microtime(true) - $tStart, count($diff)
+        ));
+        $this->applyDiff($diff, [$stamp], array_column($entries, 'slug'));
+    }
+
+    /**
+     * @return list<array{slug:string,description:string,tags:list<string>,body:string,links:list<string>}>
+     */
+    private function loadMemoryEntries(): array
+    {
+        $out = [];
+        foreach (glob($this->output . '/*.md') ?: [] as $file) {
+            $slug = basename($file, '.md');
+            if (!self::isValidSlug($slug)) {
+                continue;
+            }
+            [$fm, $body] = self::splitFrontmatter((string) file_get_contents($file));
+            $body = trim($body);
+            $out[] = [
+                'slug' => $slug,
+                'description' => (string) ($fm['description'] ?? ''),
+                'tags' => self::readTags($fm),
+                'body' => $body,
+                'links' => self::parseLinkTargets($body)
+            ];
+        }
+        return $out;
+    }
+
+    /**
+     * Group entries into prompt-sized batches that keep related entries
+     * together: everything joined by a `[[link]]` or a shared tag ends up in
+     * one cluster, clusters are then packed into batches by byte budget. A
+     * cluster larger than the budget is chunked — a shared tag like `contact`
+     * can swallow half the store, and an oversized cluster must not resurrect
+     * the unbounded single-prompt behaviour this replaces.
+     *
+     * @param list<array{slug:string,description:string,tags:list<string>,body:string,links:list<string>}> $entries
+     * @return list<list<array{slug:string,description:string,tags:list<string>,body:string,links:list<string>}>>
+     */
+    private function clusterMemories(array $entries): array
+    {
+        if ($entries === []) {
+            return [];
+        }
+        $indexBySlug = [];
+        foreach ($entries as $i => $entry) {
+            $indexBySlug[$entry['slug']] = $i;
+        }
+        $parent = range(0, count($entries) - 1);
+        $find = function (int $i) use (&$parent, &$find): int {
+            while ($parent[$i] !== $i) {
+                $parent[$i] = $parent[$parent[$i]];
+                $i = $parent[$i];
+            }
+            return $i;
+        };
+        $union = function (int $a, int $b) use (&$parent, $find): void {
+            $rootA = $find($a);
+            $rootB = $find($b);
+            if ($rootA !== $rootB) {
+                $parent[$rootB] = $rootA;
+            }
+        };
+        $firstWithTag = [];
+        foreach ($entries as $i => $entry) {
+            foreach ($entry['links'] as $target) {
+                if (isset($indexBySlug[$target])) {
+                    $union($i, $indexBySlug[$target]);
+                }
+            }
+            foreach ($entry['tags'] as $tag) {
+                if (isset($firstWithTag[$tag])) {
+                    $union($i, $firstWithTag[$tag]);
+                    continue;
+                }
+                $firstWithTag[$tag] = $i;
+            }
+        }
+        $clusters = [];
+        foreach ($entries as $i => $entry) {
+            $clusters[$find($i)][] = $entry;
+        }
+        // largest first so the big topical blocks each get their own batch and
+        // only the long tail of singletons shares one.
+        usort($clusters, static fn(array $a, array $b): int => count($b) <=> count($a));
+
+        $sizeOf = static fn(array $e): int => strlen($e['body']) + strlen($e['description']) + 64;
+        $batches = [];
+        $batch = [];
+        $bytes = 0;
+        foreach ($clusters as $cluster) {
+            $clusterBytes = array_sum(array_map($sizeOf, $cluster));
+            if ($batch !== [] && $bytes + $clusterBytes > self::COMPACT_BATCH_BYTES) {
+                $batches[] = $batch;
+                $batch = [];
+                $bytes = 0;
+            }
+            foreach ($cluster as $entry) {
+                $size = $sizeOf($entry);
+                if ($batch !== [] && $bytes + $size > self::COMPACT_BATCH_BYTES) {
+                    $batches[] = $batch;
+                    $batch = [];
+                    $bytes = 0;
+                }
+                $batch[] = $entry;
+                $bytes += $size;
+            }
+        }
+        if ($batch !== []) {
+            $batches[] = $batch;
+        }
+        return $batches;
     }
 
     private function shouldCompact(): bool
@@ -1781,18 +2124,32 @@ final class memhelper
     }
 
     /**
-     * @param string|null $source Provenance stamp the worker attributes to
+     * @param list<string> $sources Provenance stamps the worker attributes to
      *   every add/update produced by this diff. Distillation passes the
-     *   `memhelper_state.slug` of the source row; compaction passes a
-     *   `compact:<iso-ts>` marker; null = "do not record provenance".
+     *   `memhelper_state.slug` of every source row in the batch; compaction
+     *   passes a `compact:<iso-ts>` marker; [] = "do not record provenance".
+     *   An action may narrow this to a single entry via a 1-based `source`
+     *   index into the list.
+     * @param list<string> $protectedSlugs writing actions targeting one of
+     *   these slugs are dropped — used by the hub pass, which only ever sees
+     *   slugs and descriptions and must not overwrite a body it never read.
      */
-    private function applyDiff(array $diff, ?string $source = null): void
+    private function applyDiff(array $diff, array $sources = [], array $protectedSlugs = []): void
     {
         foreach ($diff as $action) {
             $a = (string) ($action['action'] ?? 'skip');
             $slug = (string) ($action['slug'] ?? '');
             if ($slug === '' || $a === 'skip') {
                 continue;
+            }
+            if ($a !== 'delete' && in_array($slug, $protectedSlugs, true)) {
+                $this->log(sprintf('diff: %s %s rejected — entry is protected in this pass', $a, $slug), 'WARN');
+                continue;
+            }
+            $actionSources = $sources;
+            $index = isset($action['source']) && is_numeric($action['source']) ? (int) $action['source'] - 1 : -1;
+            if (isset($sources[$index])) {
+                $actionSources = [$sources[$index]];
             }
             try {
                 match ($a) {
@@ -1801,7 +2158,10 @@ final class memhelper
                         (string) ($action['content'] ?? ''),
                         isset($action['description']) ? (string) $action['description'] : null,
                         self::normaliseTagList($action['tags'] ?? null),
-                        $source
+                        $actionSources,
+                        isset($action['valid_until']) && is_scalar($action['valid_until'])
+                            ? (string) $action['valid_until']
+                            : null
                     ),
                     'delete' => $this->deleteMemory($slug),
                     default => null
@@ -1891,23 +2251,90 @@ final class memhelper
         return array_keys($out);
     }
 
+    /**
+     * Last-write timestamp of an entry as a unix int. Entries written before
+     * the timestamps existed fall back to the file mtime, so the recency
+     * signal is never blank.
+     */
+    private static function readUpdated(array $frontmatter, int $fallback): int
+    {
+        $raw = $frontmatter['metadata']['updated'] ?? null;
+        if (is_scalar($raw)) {
+            $parsed = strtotime((string) $raw);
+            if ($parsed !== false) {
+                return $parsed;
+            }
+        }
+        return $fallback;
+    }
+
+    /**
+     * Expiry date of an entry as `Y-m-d`, or '' when it never expires. The ai
+     * may write anything date-ish here, so everything goes through strtotime
+     * and unparseable values degrade to "no expiry" rather than to "expired".
+     */
+    private static function readValidUntil(array $frontmatter): string
+    {
+        $raw = $frontmatter['metadata']['valid_until'] ?? null;
+        if ($raw === null || $raw === '' || !is_scalar($raw)) {
+            return '';
+        }
+        $parsed = strtotime((string) $raw);
+        return $parsed === false ? '' : date('Y-m-d', $parsed);
+    }
+
+    private static function isExpired(array $frontmatter): bool
+    {
+        $validUntil = self::readValidUntil($frontmatter);
+        return $validUntil !== '' && $validUntil < date('Y-m-d');
+    }
+
+    /**
+     * Drop every curated entry whose `valid_until` has passed. Reads the
+     * expiry off the index instead of the files so an unchanged store costs
+     * one query per tick.
+     */
+    private function expireMemories(): void
+    {
+        $slugs = $this->db->fetch_col(
+            'SELECT slug FROM memories WHERE valid_until != ? AND valid_until < ?',
+            '',
+            date('Y-m-d')
+        ) ?: [];
+        if ($slugs === []) {
+            return;
+        }
+        foreach ($slugs as $slug) {
+            try {
+                $this->deleteMemory((string) $slug);
+                $this->log('expire: dropped ' . $slug . ' (valid_until passed)');
+            } catch (RuntimeException $e) {
+                $this->log('expire: ' . $slug . ' failed — ' . $e->getMessage(), 'WARN');
+            }
+        }
+        $this->log(sprintf('expire: removed %d expired entry/entries', count($slugs)));
+    }
+
     // ====================================================================
     //  Internal — markdown CRUD (used by extraction/compaction)
     // ====================================================================
 
     /**
-     * @param list<string>|null $tags    null = keep existing tags on update,
-     *                                    []   = explicitly clear,
-     *                                    list = replace
-     * @param string|null       $source  if set, appended (unique) to the
-     *                                    entry's provenance list
+     * @param list<string>|null $tags       null = keep existing tags on update,
+     *                                       []   = explicitly clear,
+     *                                       list = replace
+     * @param list<string>      $sources    appended (unique) to the entry's
+     *                                       provenance list
+     * @param string|null       $validUntil null = keep whatever is on disk,
+     *                                       ''   = clear the expiry
      */
     private function saveMemory(
         string $slug,
         string $content,
         ?string $description,
         ?array $tags,
-        ?string $source = null
+        array $sources = [],
+        ?string $validUntil = null
     ): void {
         self::assertValidSlug($slug);
         $path = $this->pathForSlug($slug);
@@ -1915,16 +2342,27 @@ final class memhelper
         if ($tags === null) {
             $tags = self::readTags($existing);
         }
-        $sources = self::readSources($existing);
-        if ($source !== null && $source !== '' && !in_array($source, $sources, true)) {
-            $sources[] = $source;
+        $mergedSources = self::readSources($existing);
+        foreach ($sources as $source) {
+            if ($source !== '' && !in_array($source, $mergedSources, true)) {
+                $mergedSources[] = $source;
+            }
         }
+        $now = date('c');
         $metadata = [];
         if ($tags !== []) {
             $metadata['tags'] = $tags;
         }
-        if ($sources !== []) {
-            $metadata['sources'] = $sources;
+        if ($mergedSources !== []) {
+            $metadata['sources'] = $mergedSources;
+        }
+        $metadata['created'] = (string) ($existing['metadata']['created'] ?? $now);
+        $metadata['updated'] = $now;
+        $expiry = $validUntil === null
+            ? self::readValidUntil($existing)
+            : self::readValidUntil(['metadata' => ['valid_until' => $validUntil]]);
+        if ($expiry !== '') {
+            $metadata['valid_until'] = $expiry;
         }
         $frontmatter = [
             'name' => $slug,
@@ -1942,7 +2380,8 @@ final class memhelper
             'memory',
             (string) ($frontmatter['description'] ?? ''),
             trim($content),
-            (int) filemtime($path)
+            (int) filemtime($path),
+            $frontmatter
         );
     }
 
@@ -2231,8 +2670,11 @@ final class memhelper
         if ($end !== 1) {
             return [[], $raw];
         }
-        $yamlBlock = substr($rest, 0, $m[0][1]);
-        $body = substr($rest, $m[0][1] + strlen($m[0][0]));
+        // PREG_OFFSET_CAPTURE puts the byte offset in [1] — static analysis
+        // types the whole match array as strings, hence the cast.
+        $offset = (int) $m[0][1];
+        $yamlBlock = substr($rest, 0, $offset);
+        $body = substr($rest, $offset + strlen($m[0][0]));
         try {
             $parsed = Yaml::parse($yamlBlock);
             return [is_array($parsed) ? $parsed : [], $body];

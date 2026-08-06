@@ -6,8 +6,8 @@
         "php": "^8.3",
         "ext-pdo": "*",
         "ext-json": "*",
-        "symfony/yaml": "^8.1.1",
-        "vielhuber/aihelper": "^4.1.9",
+        "symfony/yaml": "^8.1.2",
+        "vielhuber/aihelper": "^4.7.3",
         "vielhuber/dbhelper": "^2.5.5",
         "vielhuber/simplemcp": "^1.1.4"
     },

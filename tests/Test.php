@@ -528,4 +528,215 @@ final class Test extends TestCase
         $this->assertSame('dbrow:external:notes:3', $rows[1]['slug']);
         $this->assertSame('body: third', $rows[1]['body']);
     }
+
+    public function testExpiredMemoryIsDroppedByTheWorker(): void
+    {
+        $this->writeMemory('old-booking', 'Hotelbuchung in Rom.', validUntil: '2020-01-01');
+        $this->writeMemory('travel-preferences', 'Der User reist gerne nach Rom.');
+
+        $this->mem()->work();
+
+        $this->assertFileDoesNotExist($this->tmpDir . '/old-booking.md');
+        $this->assertFileExists($this->tmpDir . '/travel-preferences.md');
+        $slugs = array_column($this->mem()->grab('Rom'), 'slug');
+        $this->assertSame(['travel-preferences'], $slugs);
+    }
+
+    public function testMemoryValidIntoTheFutureSurvivesAndStaysSearchable(): void
+    {
+        $this->writeMemory('running-contract', 'Der Vertrag läuft noch.', validUntil: date('Y-m-d', time() + 86400 * 30));
+
+        $this->mem()->work();
+
+        $this->assertFileExists($this->tmpDir . '/running-contract.md');
+        $this->assertSame(['running-contract'], array_column($this->mem()->grab('Vertrag'), 'slug'));
+    }
+
+    public function testScoresArePositiveAndDescending(): void
+    {
+        $this->writeMemory('editor-preferences', 'Der User nutzt Helix als Editor.');
+        $this->writeMemory('editor-history', 'Frueher nutzte der User einen anderen Editor.');
+        $this->mem()->work();
+
+        $facts = $this->mem()->grab('editor');
+
+        $this->assertCount(2, $facts);
+        $this->assertGreaterThan(0, $facts[0]['score']);
+        $this->assertGreaterThanOrEqual($facts[1]['score'], $facts[0]['score']);
+    }
+
+    public function testNeighbourRankingPrefersTheMultiplyReferencedEntry(): void
+    {
+        // both primaries match the query and link to the hub; only one of them
+        // links to the side entry — so the hub must be the first neighbour.
+        $this->writeMemory('contract-hosting', 'Hosting-Vertrag, siehe [[household-budget]].');
+        $this->writeMemory('contract-internet', 'Internet-Vertrag, siehe [[household-budget]] und [[side-note]].');
+        $this->writeMemory('household-budget', 'Haushaltsbuch des Users.');
+        $this->writeMemory('side-note', 'Eine Randnotiz.');
+        $this->mem()->work();
+
+        $facts = $this->mem()->grab('vertrag', 2);
+
+        $neighbours = array_values(array_filter($facts, static fn(array $f): bool => $f['via'] === 'link'));
+        $this->assertNotSame([], $neighbours);
+        $this->assertSame('household-budget', $neighbours[0]['slug']);
+    }
+
+    public function testPendingSourcesArePackedIntoOneBatch(): void
+    {
+        $rows = [
+            ['slug' => 'attached:/tmp/a.txt', 'body' => 'first'],
+            ['slug' => 'attached:/tmp/b.txt', 'body' => 'second'],
+            ['slug' => 'dbrow:external:notes:1', 'body' => 'third']
+        ];
+
+        $batches = $this->invoke('batchSources', $rows);
+
+        $this->assertCount(1, $batches);
+        $this->assertCount(3, $batches[0]);
+        $this->assertSame('/tmp/a.txt', $batches[0][0]['label']);
+        $this->assertSame('dbrow:external:notes:1', $batches[0][2]['label']);
+    }
+
+    public function testSourceBatchesRespectTheByteBudget(): void
+    {
+        file_put_contents($this->cfgPath, "output: " . $this->tmpDir . "\nmax_source_bytes: 1000\n");
+        $rows = [
+            ['slug' => 'dbrow:external:notes:1', 'body' => str_repeat('a', 800)],
+            ['slug' => 'dbrow:external:notes:2', 'body' => str_repeat('b', 800)]
+        ];
+
+        $batches = $this->invoke('batchSources', $rows);
+
+        $this->assertCount(2, $batches);
+        $this->assertCount(1, $batches[0]);
+        $this->assertCount(1, $batches[1]);
+    }
+
+    public function testCompactionClustersLinkedAndTaggedEntriesTogether(): void
+    {
+        $entries = [
+            ['slug' => 'a', 'description' => '', 'tags' => ['contact'], 'body' => 'refers to [[b]]', 'links' => ['b']],
+            ['slug' => 'b', 'description' => '', 'tags' => [], 'body' => '', 'links' => []],
+            ['slug' => 'c', 'description' => '', 'tags' => ['contact'], 'body' => '', 'links' => []],
+            ['slug' => 'z', 'description' => '', 'tags' => ['unrelated'], 'body' => '', 'links' => []]
+        ];
+
+        $batches = $this->invoke('clusterMemories', $entries);
+
+        // everything fits one prompt budget, so the clustering shows up as the
+        // ordering inside the single batch: the a/b/c cluster comes first.
+        $this->assertCount(1, $batches);
+        $this->assertSame(['a', 'b', 'c', 'z'], array_column($batches[0], 'slug'));
+    }
+
+    public function testOversizedClustersAreSplitAcrossBatches(): void
+    {
+        $entries = [];
+        foreach (range(1, 5) as $i) {
+            $entries[] = [
+                'slug' => 'entry-' . $i,
+                'description' => '',
+                'tags' => ['shared'],
+                'body' => str_repeat('x', 20000),
+                'links' => []
+            ];
+        }
+
+        $batches = $this->invoke('clusterMemories', $entries);
+
+        $this->assertGreaterThan(1, count($batches));
+        $this->assertSame(5, array_sum(array_map('count', $batches)));
+    }
+
+    public function testSaveMemoryStampsCreatedAndKeepsItOnUpdate(): void
+    {
+        $memory = $this->mem();
+        $apply = new \ReflectionMethod(memhelper::class, 'applyDiff');
+        $apply->invoke($memory, [['action' => 'add', 'slug' => 'foo', 'content' => 'one']], ['manual']);
+        $created = self::frontmatterOf($this->tmpDir . '/foo.md')['metadata']['created'];
+
+        $apply->invoke($memory, [['action' => 'update', 'slug' => 'foo', 'content' => 'two']], ['manual']);
+        $frontmatter = self::frontmatterOf($this->tmpDir . '/foo.md');
+
+        $this->assertSame($created, $frontmatter['metadata']['created']);
+        $this->assertArrayHasKey('updated', $frontmatter['metadata']);
+        $this->assertArrayNotHasKey('valid_until', $frontmatter['metadata']);
+    }
+
+    public function testProtectedSlugsRejectWritesButAllowDeletes(): void
+    {
+        $this->writeMemory('keep-me', 'Original body.');
+        $memory = $this->mem();
+        $apply = new \ReflectionMethod(memhelper::class, 'applyDiff');
+
+        $apply->invoke($memory, [['action' => 'update', 'slug' => 'keep-me', 'content' => 'overwritten']], [], ['keep-me']);
+        $this->assertStringContainsString('Original body.', (string) file_get_contents($this->tmpDir . '/keep-me.md'));
+
+        $apply->invoke($memory, [['action' => 'delete', 'slug' => 'keep-me']], [], ['keep-me']);
+        $this->assertFileDoesNotExist($this->tmpDir . '/keep-me.md');
+    }
+
+    public function testIndexUpgradeRebuildsMemoriesWithoutDiscardingDistilledSources(): void
+    {
+        $filesDir = $this->tmpDir . '/docs';
+        mkdir($filesDir);
+        file_put_contents($filesDir . '/notes.txt', 'Some source text.');
+        $this->writeConfig($filesDir);
+        $this->writeMemory('editor-preferences', 'Editor ist Helix.');
+        $this->mem()->work();
+
+        $dbPath = $this->tmpDir . '/.data/memhelper.db';
+        $pdo = new \PDO('sqlite:' . $dbPath);
+        $pdo->exec("UPDATE memhelper_state SET distilled_at = 1700000000 WHERE kind = 'source'");
+        // downgrade the fts5 table to the pre-1.3 layout
+        $pdo->exec('DROP TABLE memories');
+        $pdo->exec('CREATE VIRTUAL TABLE memories USING fts5(slug UNINDEXED, kind UNINDEXED, title, body)');
+        unset($pdo);
+
+        $this->mem()->work();
+
+        $pdo = new \PDO('sqlite:' . $dbPath);
+        $source = $pdo->query(
+            "SELECT body, distilled_at FROM memhelper_state WHERE kind = 'source'"
+        )->fetch(\PDO::FETCH_ASSOC);
+        $this->assertSame('Some source text.', $source['body'], 'staged source body must survive the index upgrade');
+        $this->assertSame(1700000000, (int) $source['distilled_at'], 'upgrade must not force a re-distillation');
+        $this->assertSame(['editor-preferences'], array_column($this->mem()->grab('editor'), 'slug'));
+    }
+
+    public function testHandEditedExpiryReachesTheIndexWithoutABodyChange(): void
+    {
+        $this->writeMemory('booking', 'Hotelbuchung in Rom.');
+        $this->mem()->work();
+        $this->assertFileExists($this->tmpDir . '/booking.md');
+
+        // same body, only the frontmatter gains an expiry — the mtime-only
+        // fast path used to swallow this.
+        $this->writeMemory('booking', 'Hotelbuchung in Rom.', validUntil: '2020-01-01');
+        touch($this->tmpDir . '/booking.md', time() + 10);
+        $this->mem()->work();
+
+        $this->assertFileDoesNotExist($this->tmpDir . '/booking.md');
+    }
+
+    private function writeMemory(string $slug, string $body, ?string $validUntil = null): void
+    {
+        $frontmatter = "---\nname: " . $slug . "\ndescription: " . $slug . "\nmetadata:\n  tags:\n    - test\n";
+        if ($validUntil !== null) {
+            $frontmatter .= "  valid_until: '" . $validUntil . "'\n";
+        }
+        file_put_contents($this->tmpDir . '/' . $slug . '.md', $frontmatter . "---\n\n" . $body . "\n");
+    }
+
+    private function invoke(string $method, mixed ...$args): mixed
+    {
+        return (new \ReflectionMethod(memhelper::class, $method))->invoke($this->mem(), ...$args);
+    }
+
+    private static function frontmatterOf(string $path): array
+    {
+        $split = new \ReflectionMethod(memhelper::class, 'splitFrontmatter');
+        return $split->invoke(null, (string) file_get_contents($path))[0];
+    }
 }

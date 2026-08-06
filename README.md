@@ -8,7 +8,7 @@
 
 # 🧠 memhelper 🧠
 
-Markdown-first memory layer for LLM agents. Exposes a `grab(query)` MCP tool that returns the curated facts most relevant to a natural-language question. A separate supervisor worker handles all writes — refreshing the search index across every configured input source, distilling new sources via an LLM, and periodically compacting duplicates and obsolete entries. Memory entries are plain `.md` files with a tiny YAML frontmatter — readable, editable, git-versionable. Cross-references between entries are written as `[[slug]]` wiki-links and followed one hop at retrieval time, so a single query surfaces related neighbours automatically.
+Markdown-first memory layer for LLM agents. Exposes a `grab(query)` MCP tool that returns the curated facts most relevant to a natural-language question. A separate supervisor worker handles all writes — refreshing the search index across every configured input source, distilling new sources via an LLM, and periodically compacting duplicates and obsolete entries. Memory entries are plain `.md` files with a tiny YAML frontmatter — readable, editable, git-versionable. Cross-references between entries are written as `[[slug]]` wiki-links and followed one hop at retrieval time, so a single query surfaces related neighbours automatically. Ranking fuses full-text relevance (bm25 over description, body and tags) with the entry's degree in the link graph and its recency, into a single positive score — higher is better. Entries carrying a `valid_until` date are hidden once it passes and dropped on the next worker tick.
 
 ## installation
 
@@ -70,8 +70,30 @@ $facts = $memory->grab(
     limit: 10
 );
 // → [['slug' => 'pet-roger', 'tags' => ['pet', 'dog'], 'description' => '...',
-//     'body' => '...', 'sources' => ['dbrow:…'], 'score' => -3.41, 'via' => null], ...]
+//     'body' => '...', 'sources' => ['dbrow:…'], 'score' => 1.0824, 'via' => null], ...]
 ```
+
+### memory entries
+
+```markdown
+---
+name: pet-roger
+description: der Hund des Users
+metadata:
+    tags:
+        - pet
+        - dog
+    sources:
+        - dbrow:charly:chats_messages:42
+    created: '2026-08-06T09:12:44+02:00'
+    updated: '2026-08-06T09:12:44+02:00'
+    valid_until: '2027-03-31'
+---
+
+Der Hund des Users heißt Roger. Roger gehört zu [[household-budget]].
+```
+
+`created` / `updated` are stamped by the worker; `valid_until` is optional and may be set by hand or by the LLM when a fact has a known end date. Everything else is free to edit — the worker picks changes up on the next tick.
 
 ## worker
 
