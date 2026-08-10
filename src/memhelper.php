@@ -44,6 +44,7 @@ final class memhelper
     private int $maxSourceBytes;
     private int $existingMemoryLimit;
     private int $aiUnavailableUntil = 0;
+    private const AI_CONFIGURATION_RETRY_SECONDS = 3600;
 
     /**
      * The host may pass the absolute path of its memhelper yaml explicitly,
@@ -1694,6 +1695,11 @@ final class memhelper
             } catch (\Throwable $e) {
                 $this->log(sprintf('distill: batch %d — ai failed: %s', $batchNo, $e->getMessage()), 'WARN');
                 $error = strtolower($e->getMessage());
+                if (str_contains($error, 'harness: binary') && str_contains($error, 'not found')) {
+                    $this->aiUnavailableUntil = time() + self::AI_CONFIGURATION_RETRY_SECONDS;
+                    $this->log('distill: paused because the configured harness is unavailable', 'WARN');
+                    break;
+                }
                 if (str_contains($error, 'context window') || str_contains($error, 'prompt is too long')) {
                     // a multi-source batch that overflows is worth retrying in
                     // halves; a single source that overflows on its own never
@@ -2437,11 +2443,20 @@ final class memhelper
     private function callAi(string $prompt): string
     {
         $apiKey = (string) ($this->aiConfig['api_key'] ?? '');
+        $sshHost = (string) ($this->aiConfig['cli_ssh_host'] ?? '');
+        $sshUser = (string) ($this->aiConfig['cli_ssh_user'] ?? '');
+        $sshKey = (string) ($this->aiConfig['cli_ssh_key'] ?? '');
         $ai = aihelper::create(
             provider: (string) $this->aiConfig['provider'],
             model: (string) $this->aiConfig['model'],
             api_key: $apiKey !== '' ? $apiKey : null,
-            max_tries: 3
+            max_tries: 3,
+            cli_ssh_host: $sshHost !== '' ? $sshHost : null,
+            cli_ssh_user: $sshUser !== '' ? $sshUser : null,
+            cli_ssh_port: isset($this->aiConfig['cli_ssh_port']) && is_numeric($this->aiConfig['cli_ssh_port'])
+                ? (int) $this->aiConfig['cli_ssh_port']
+                : null,
+            cli_ssh_key: $sshKey !== '' ? $sshKey : null
         );
         $result = $ai->ask(prompt: $prompt);
         if (!($result['success'] ?? false)) {

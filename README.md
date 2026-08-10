@@ -21,6 +21,10 @@ ai:
     provider: openai
     model: gpt-5
     api_key: sk-...
+    cli_ssh_host:
+    cli_ssh_user:
+    cli_ssh_port:
+    cli_ssh_key:
 
 output: /path/to/memory
 max_source_bytes: 20000

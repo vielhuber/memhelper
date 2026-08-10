@@ -105,7 +105,7 @@ final class Test extends TestCase
         // for a future distill pass.
         $filesDir = $this->tmpDir . '/docs';
         mkdir($filesDir);
-        file_put_contents($filesDir . '/notes.txt', 'Charly is a multi-agent orchestrator built in php.');
+        file_put_contents($filesDir . '/notes.txt', 'The application is a multi-agent orchestrator built in php.');
         $this->writeConfig($filesDir);
         $this->mem()->work();
         $pdo = new \PDO('sqlite:' . $this->tmpDir . '/.data/memhelper.db');
@@ -114,7 +114,7 @@ final class Test extends TestCase
         )->fetch(\PDO::FETCH_ASSOC);
         $this->assertIsArray($row);
         $this->assertSame('source', $row['kind']);
-        $this->assertSame('Charly is a multi-agent orchestrator built in php.', $row['body']);
+        $this->assertSame('The application is a multi-agent orchestrator built in php.', $row['body']);
     }
 
     public function testDistillationWaitsDuringProviderCapacityPause(): void
@@ -144,28 +144,55 @@ final class Test extends TestCase
         $this->assertNull($distilledAt);
     }
 
+    /** Preserve remote harness transport settings for AIHelper calls. */
+    public function testHarnessSshConfigurationIsLoaded(): void
+    {
+        file_put_contents($this->cfgPath, implode("\n", [
+            'output: ' . $this->tmpDir,
+            'ai:',
+            '    provider: codex',
+            '    model: gpt-5.6-sol',
+            '    cli_ssh_host: host.docker.internal',
+            '    cli_ssh_user: root',
+            '    cli_ssh_port: 22',
+            '    cli_ssh_key: /host/data/ssh/harness',
+            ''
+        ]));
+        $memory = $this->mem();
+        $configuration = new \ReflectionProperty(memhelper::class, 'aiConfig');
+
+        $this->assertSame([
+            'provider' => 'codex',
+            'model' => 'gpt-5.6-sol',
+            'cli_ssh_host' => 'host.docker.internal',
+            'cli_ssh_user' => 'root',
+            'cli_ssh_port' => 22,
+            'cli_ssh_key' => '/host/data/ssh/harness'
+        ], $configuration->getValue($memory));
+    }
+
     public function testCrossReferenceExpansionPullsLinkedNeighbour(): void
     {
         // a query that lexically matches only one entry should still surface
         // its [[…]]-linked neighbour because grab does a 1-hop expand.
         file_put_contents(
-            $this->tmpDir . '/contact-julia.md',
-            "---\nname: contact-julia\ndescription: contact julia fuchs\nmetadata:\n  type: user\n---\n\nJulia Fuchs ist die Schwester von [[user-name-david]].\n"
+            $this->tmpDir . '/primary-contact.md',
+            "---\nname: primary-contact\ndescription: primary contact profile\nmetadata:\n  type: user\n---\n\nDie Kontaktperson ist mit [[user-profile]] verknuepft.\n"
         );
         file_put_contents(
-            $this->tmpDir . '/user-name-david.md',
-            "---\nname: user-name-david\ndescription: name of the user\nmetadata:\n  type: user\n---\n\nDer User heißt David Vielhuber.\n"
+            $this->tmpDir . '/user-profile.md',
+            "---\nname: user-profile\ndescription: profile of the user\nmetadata:\n  type: user\n---\n\nDas Profil gehoert zum User.\n"
         );
         $this->mem()->work();
 
-        $facts = $this->mem()->grab('kennst du Julia Fuchs?');
+        $facts = $this->mem()->grab('kennst du die Kontaktperson?');
         $slugs = array_column($facts, 'slug');
-        $this->assertContains('contact-julia', $slugs);
-        $this->assertContains('user-name-david', $slugs);
-        $julia = $facts[array_search('contact-julia', $slugs, true)];
-        $david = $facts[array_search('user-name-david', $slugs, true)];
-        $this->assertNull($julia['via']);
-        $this->assertSame('link', $david['via']);
+        $this->assertContains('primary-contact', $slugs);
+        $this->assertContains('user-profile', $slugs);
+        $contactFact = $facts[array_search('primary-contact', $slugs, true)];
+        $userFact = $facts[array_search('user-profile', $slugs, true)];
+        $this->assertNull($contactFact['via']);
+        $this->assertSame('link', $userFact['via']);
     }
 
     public function testLinkTableIsRebuiltOnFirstTickAfterUpgrade(): void
