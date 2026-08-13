@@ -110,9 +110,7 @@ final class memhelper
     }
 
     /**
-     * Append a line to the log file (when configured) and mirror to stderr
-     * under the CLI SAPI so supervisord captures it too. Best-effort — write
-     * failures are silent so logging cannot abort a tick.
+     * Append a line to the configured log or stderr under the CLI SAPI.
      */
     private function log(string $msg, string $level = 'INFO'): void
     {
@@ -120,7 +118,7 @@ final class memhelper
         if ($this->logPath !== null) {
             @file_put_contents($this->logPath, $line, FILE_APPEND);
         }
-        if (PHP_SAPI === 'cli') {
+        if ($this->logPath === null && PHP_SAPI === 'cli') {
             @fwrite(STDERR, $line);
         }
     }
