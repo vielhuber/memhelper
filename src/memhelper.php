@@ -44,6 +44,7 @@ final class memhelper
     private int $maxSourceBytes;
     private int $existingMemoryLimit;
     private int $aiUnavailableUntil = 0;
+    private ?string $compactionPauseSource = null;
     private const AI_CONFIGURATION_RETRY_SECONDS = 3600;
 
     /**
@@ -267,6 +268,8 @@ final class memhelper
                 $this->log('compaction is due (last run > 24 h ago)');
                 $this->compact();
                 $this->markCompacted();
+            } elseif ($this->compactionPauseSource !== null) {
+                $this->log('compaction paused by input database guard: ' . $this->compactionPauseSource);
             } else {
                 $this->log('compaction skipped (last run within 24 h)');
             }
@@ -2106,11 +2109,38 @@ final class memhelper
 
     private function shouldCompact(): bool
     {
+        $this->compactionPauseSource = null;
         $last = (int) ($this->db->fetch_var(
             'SELECT updated_at FROM memhelper_meta WHERE key = ?',
             self::COMPACT_KEY
         ) ?: 0);
-        return time() - $last > self::COMPACT_INTERVAL_SECONDS;
+        if (time() - $last <= self::COMPACT_INTERVAL_SECONDS) {
+            return false;
+        }
+        foreach ($this->inputDbs as $index => $inputDb) {
+            $query = trim((string) ($inputDb['compaction_pause_when'] ?? ''));
+            if ($query === '') {
+                continue;
+            }
+            if (str_contains($query, ';')) {
+                $this->log('input_dbs[' . ($index + 1) . ']: compaction guard must not contain semicolons', 'WARN');
+                continue;
+            }
+            $alias = 'compaction-guard-' . ($index + 1);
+            $source = $this->openInputDb($inputDb, $alias);
+            if ($source === null) {
+                continue;
+            }
+            try {
+                if ((int) ($source->fetch_var($query) ?? 0) > 0) {
+                    $this->compactionPauseSource = $alias;
+                    return false;
+                }
+            } catch (\Throwable $exception) {
+                $this->log($alias . ': query failed — ' . $exception->getMessage(), 'WARN');
+            }
+        }
+        return true;
     }
 
     private function markCompacted(): void

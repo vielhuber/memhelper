@@ -40,6 +40,7 @@ input_dbs:
       include_tables: [chats_messages] # optional
       where: # optional
           chats_messages: role = 'user' AND status = 'completed'
+      compaction_pause_when: SELECT COUNT(*) FROM jobs WHERE status = 'running' # optional
 
     - driver: mysql
       host: 127.0.0.1

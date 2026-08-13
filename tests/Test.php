@@ -407,6 +407,34 @@ final class Test extends TestCase
         $this->assertStringContainsString('Remember this.', $rows[0]['body']);
     }
 
+    /**
+     * Keep daily compaction away from externally reported busy periods.
+     */
+    public function testInputDbGuardPausesCompaction(): void
+    {
+        $externalDatabasePath = $this->tmpDir . '/external.db';
+        $externalDatabase = new \PDO('sqlite:' . $externalDatabasePath);
+        $externalDatabase->exec('CREATE TABLE jobs (id INTEGER PRIMARY KEY, status TEXT)');
+        $externalDatabase->exec("INSERT INTO jobs (id, status) VALUES (1, 'running')");
+        unset($externalDatabase);
+        $logPath = $this->tmpDir . '/memory.log';
+        file_put_contents($this->cfgPath, implode("\n", [
+            'output: ' . $this->tmpDir,
+            'input_dbs:',
+            '    - driver: sqlite',
+            '      path: ' . $externalDatabasePath,
+            "      compaction_pause_when: SELECT COUNT(*) FROM jobs WHERE status = 'running'",
+            ''
+        ]));
+
+        (new memhelper($this->cfgPath, $logPath))->work();
+
+        $this->assertStringContainsString(
+            'compaction paused by input database guard: compaction-guard-1',
+            (string) file_get_contents($logPath)
+        );
+    }
+
     public function testInputDbsExcludeTablesAddsToBlacklist(): void
     {
         $extDbPath = $this->tmpDir . '/external.db';
