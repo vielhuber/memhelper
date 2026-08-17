@@ -4,6 +4,7 @@ ai:
     api_key: sk-...
 
 output: /path/to/memory
+injection_max_bytes: 12000
 
 input_files:
     - /path/to/external/docs
@@ -15,6 +16,16 @@ input_dbs:
       include_tables: [chats_messages]
       where:
           chats_messages: role = 'user' AND status = 'completed'
+
+    - key: project-chats
+      driver: sqlite
+      path: /path/to/database.db
+      query: |
+          SELECT messages.id, projects.path AS scope, messages.role, messages.content
+          FROM messages INNER JOIN projects ON projects.id = messages.project_id
+      primary_key: id
+      scope_column: scope
+      content_columns: [role, content]
 
     - driver: mysql
       host: 127.0.0.1

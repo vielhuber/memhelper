@@ -29,6 +29,7 @@ ai:
 output: /path/to/memory
 max_source_bytes: 20000
 existing_memory_limit: 200
+injection_max_bytes: 12000
 
 input_files:
     - /path/to/external/docs
@@ -41,6 +42,16 @@ input_dbs:
       where: # optional
           chats_messages: role = 'user' AND status = 'completed'
       compaction_pause_when: SELECT COUNT(*) FROM jobs WHERE status = 'running' # optional
+
+    - key: project-chats
+      driver: sqlite
+      path: /path/to/database.db
+      query: |
+          SELECT messages.id, projects.path AS scope, messages.role, messages.content
+          FROM messages INNER JOIN projects ON projects.id = messages.project_id
+      primary_key: id
+      scope_column: scope
+      content_columns: [role, content]
 
     - driver: mysql
       host: 127.0.0.1
@@ -76,7 +87,20 @@ $facts = $memory->grab(
 );
 // → [['slug' => 'pet-roger', 'tags' => ['pet', 'dog'], 'description' => '...',
 //     'body' => '...', 'sources' => ['dbrow:…'], 'score' => 1.0824, 'via' => null], ...]
+
+$projectFacts = $memory->grab(
+    scope: '/var/www/project',
+    query: 'database migration',
+    limit: 10,
+);
+
+$systemPrompt = $memory->inject(
+    scope: '/var/www/project',
+    context: 'Implement the next database migration.'
+);
 ```
+
+`scope` is an exact technical namespace, independent of semantic memory tags. Distillation, links, retrieval and compaction never cross scope boundaries. `inject()` performs no AI call; it reads the already curated FTS index, follows scoped links and returns a size-limited Markdown block. Without a scope, `grab()` continues to use only the global memory store.
 
 ### memory entries
 

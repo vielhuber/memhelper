@@ -88,6 +88,213 @@ final class Test extends TestCase
         $this->assertNull($facts[0]['via']);
     }
 
+    /**
+     * Keep both facts and link expansion inside the exact project namespace.
+     */
+    public function testProjectScopesKeepIdenticalSlugsIsolated(): void
+    {
+        $memory = $this->mem();
+        $apply = new \ReflectionMethod(memhelper::class, 'applyDiff');
+        $apply->invoke(
+            $memory,
+            [[
+                'action' => 'add',
+                'slug' => 'database-choice',
+                'content' => 'Project Alpha uses PostgreSQL and follows [[deployment-rule]].'
+            ], [
+                'action' => 'add',
+                'slug' => 'deployment-rule',
+                'content' => 'Project Alpha deploys from a release branch.'
+            ]],
+            [],
+            [],
+            '/var/www/alpha'
+        );
+        $apply->invoke(
+            $memory,
+            [[
+                'action' => 'add',
+                'slug' => 'database-choice',
+                'content' => 'Project Beta uses SQLite and follows [[deployment-rule]].'
+            ], [
+                'action' => 'add',
+                'slug' => 'deployment-rule',
+                'content' => 'Project Beta deploys directly from main.'
+            ]],
+            [],
+            [],
+            '/var/www/beta'
+        );
+
+        $this->assertSame([], $memory->grab('PostgreSQL'));
+        $alphaFacts = $memory->grab('PostgreSQL', 10, '/var/www/alpha');
+        $betaFacts = $memory->grab('SQLite', 10, '/var/www/beta');
+        $this->assertSame(
+            ['Project Alpha uses PostgreSQL and follows [[deployment-rule]].', 'Project Alpha deploys from a release branch.'],
+            array_column($alphaFacts, 'body')
+        );
+        $this->assertSame(
+            ['Project Beta uses SQLite and follows [[deployment-rule]].', 'Project Beta deploys directly from main.'],
+            array_column($betaFacts, 'body')
+        );
+    }
+
+    /**
+     * Build bounded prompt context exclusively from the curated local index.
+     */
+    public function testInjectBuildsProjectContextWithoutAiCall(): void
+    {
+        $memory = $this->mem();
+        $apply = new \ReflectionMethod(memhelper::class, 'applyDiff');
+        $apply->invoke(
+            $memory,
+            [['action' => 'add', 'slug' => 'database-choice', 'content' => 'The project uses PostgreSQL for persistence.']],
+            [],
+            [],
+            '/var/www/alpha'
+        );
+        $apply->invoke(
+            $memory,
+            [['action' => 'add', 'slug' => 'deployment-rule', 'content' => 'Deployments use a separate release branch.']],
+            [],
+            [],
+            '/var/www/alpha'
+        );
+
+        $context = $memory->inject('/var/www/alpha', 'Adjust the PostgreSQL migration.');
+
+        $this->assertStringContainsString('Project memory', $context);
+        $this->assertStringContainsString('PostgreSQL', $context);
+        $this->assertStringNotContainsString('release branch', $context);
+
+        $recentContext = $memory->inject('/var/www/alpha');
+        $this->assertStringContainsString('PostgreSQL', $recentContext);
+        $this->assertStringContainsString('release branch', $recentContext);
+        $this->assertSame('', $memory->inject('/var/www/beta'));
+    }
+
+    /**
+     * Reject scoped files whose directory hash does not match their namespace.
+     */
+    public function testScopedFilesOnlyLoadFromTheirMatchingNamespaceDirectory(): void
+    {
+        $directory = $this->tmpDir . '/.scopes/incorrect';
+        mkdir($directory, recursive: true);
+        file_put_contents($directory . '/database-choice.md', implode("\n", [
+            '---',
+            'name: database-choice',
+            'scope: /var/www/alpha',
+            '---',
+            'Project Alpha uses PostgreSQL.',
+            ''
+        ]));
+
+        $memory = $this->mem();
+        $memory->work();
+
+        $this->assertSame([], $memory->grab('PostgreSQL', 10, '/var/www/alpha'));
+    }
+
+    /**
+     * Keep injected prompt content inside its configured byte budget.
+     */
+    public function testInjectTruncatesAnOversizedFactWithinTheConfiguredLimit(): void
+    {
+        file_put_contents($this->cfgPath, implode("\n", [
+            'output: ' . $this->tmpDir,
+            'injection_max_bytes: 1000',
+            ''
+        ]));
+        $memory = $this->mem();
+        $apply = new \ReflectionMethod(memhelper::class, 'applyDiff');
+        $apply->invoke(
+            $memory,
+            [[
+                'action' => 'add',
+                'slug' => 'database-choice',
+                'content' => 'PostgreSQL ' . str_repeat('database details ', 200)
+            ]],
+            [],
+            [],
+            '/var/www/alpha'
+        );
+
+        $context = $memory->inject('/var/www/alpha', 'PostgreSQL');
+
+        $this->assertLessThanOrEqual(1000, strlen($context));
+        $this->assertStringContainsString('PostgreSQL', $context);
+        $this->assertStringEndsWith('[truncated]', $context);
+    }
+
+    /**
+     * Reflect query-backed source additions, updates and removals in staging.
+     */
+    public function testQuerySourceStagesRowsWithTheirScope(): void
+    {
+        $externalPath = $this->tmpDir . '/external.db';
+        $external = new \PDO('sqlite:' . $externalPath);
+        $external->exec('CREATE TABLE chats (id TEXT PRIMARY KEY, code_folder TEXT)');
+        $external->exec('CREATE TABLE chats_messages (id TEXT PRIMARY KEY, chat_id TEXT, role TEXT, content TEXT)');
+        $external->exec("INSERT INTO chats VALUES ('chat-1', '/var/www/alpha')");
+        $external->exec("INSERT INTO chats_messages VALUES ('message-1', 'chat-1', 'user', 'Use PostgreSQL for this project.')");
+        unset($external);
+
+        file_put_contents($this->cfgPath, implode("\n", [
+            'output: ' . $this->tmpDir,
+            'input_dbs:',
+            '    - key: project-chats',
+            '      driver: sqlite',
+            '      path: ' . $externalPath,
+            '      query: |',
+            '          SELECT chats_messages.id, chats.code_folder AS scope, chats_messages.role, chats_messages.content',
+            '          FROM chats_messages INNER JOIN chats ON chats.id = chats_messages.chat_id',
+            '      primary_key: id',
+            '      scope_column: scope',
+            '      content_columns: [role, content]',
+            ''
+        ]));
+
+        $this->mem()->work();
+
+        $database = new \PDO('sqlite:' . $this->tmpDir . '/.data/memhelper.db');
+        $source = $database->query(
+            "SELECT scope, body, distilled_at FROM memhelper_state WHERE kind = 'source' AND slug LIKE 'dbquery:%'"
+        )->fetch(\PDO::FETCH_ASSOC);
+        $this->assertSame('/var/www/alpha', $source['scope']);
+        $this->assertSame("role: user\ncontent: Use PostgreSQL for this project.", $source['body']);
+
+        $external = new \PDO('sqlite:' . $externalPath);
+        $external->exec(
+            "UPDATE chats SET code_folder = '/var/www/beta' WHERE id = 'chat-1'"
+        );
+        $external->exec(
+            "UPDATE chats_messages SET content = 'Use SQLite for this project.' WHERE id = 'message-1'"
+        );
+        unset($external, $database);
+        $this->mem()->work();
+
+        $database = new \PDO('sqlite:' . $this->tmpDir . '/.data/memhelper.db');
+        $source = $database->query(
+            "SELECT scope, body, distilled_at FROM memhelper_state WHERE kind = 'source' AND slug LIKE 'dbquery:%'"
+        )->fetch(\PDO::FETCH_ASSOC);
+        $this->assertSame('/var/www/beta', $source['scope']);
+        $this->assertSame("role: user\ncontent: Use SQLite for this project.", $source['body']);
+        $this->assertNull($source['distilled_at']);
+
+        $external = new \PDO('sqlite:' . $externalPath);
+        $external->exec("DELETE FROM chats_messages WHERE id = 'message-1'");
+        unset($external, $database);
+        $this->mem()->work();
+
+        $database = new \PDO('sqlite:' . $this->tmpDir . '/.data/memhelper.db');
+        $this->assertSame(
+            0,
+            (int) $database->query(
+                "SELECT COUNT(*) FROM memhelper_state WHERE kind = 'source' AND slug LIKE 'dbquery:%'"
+            )->fetchColumn()
+        );
+    }
+
     public function testEmptyQueryReturnsEmpty(): void
     {
         $this->seedEditorMemory();
@@ -668,6 +875,25 @@ final class Test extends TestCase
         $this->assertCount(1, $batches[1]);
     }
 
+    /**
+     * Prevent one distillation call from receiving multiple project namespaces.
+     */
+    public function testSourceBatchesNeverMixProjectScopes(): void
+    {
+        $rows = [
+            ['slug' => 'dbquery:projects:1', 'scope' => '/var/www/alpha', 'body' => 'first'],
+            ['slug' => 'dbquery:projects:2', 'scope' => '/var/www/beta', 'body' => 'second'],
+            ['slug' => 'dbquery:projects:3', 'scope' => '/var/www/alpha', 'body' => 'third']
+        ];
+
+        $batches = $this->invoke('batchSources', $rows);
+
+        $this->assertCount(3, $batches);
+        $this->assertSame(['/var/www/alpha'], array_unique(array_column($batches[0], 'scope')));
+        $this->assertSame(['/var/www/beta'], array_unique(array_column($batches[1], 'scope')));
+        $this->assertSame(['/var/www/alpha'], array_unique(array_column($batches[2], 'scope')));
+    }
+
     public function testCompactionClustersLinkedAndTaggedEntriesTogether(): void
     {
         $entries = [
@@ -744,7 +970,32 @@ final class Test extends TestCase
         $dbPath = $this->tmpDir . '/.data/memhelper.db';
         $pdo = new \PDO('sqlite:' . $dbPath);
         $pdo->exec("UPDATE memhelper_state SET distilled_at = 1700000000 WHERE kind = 'source'");
-        // downgrade the fts5 table to the pre-1.3 layout
+        $pdo->exec('ALTER TABLE memhelper_state RENAME TO memhelper_state_scoped');
+        $pdo->exec(
+            'CREATE TABLE memhelper_state (
+                slug TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                mtime INTEGER NOT NULL,
+                hash TEXT NOT NULL,
+                body TEXT,
+                indexed_at INTEGER NOT NULL,
+                distilled_at INTEGER
+            )'
+        );
+        $pdo->exec(
+            'INSERT INTO memhelper_state
+             (slug, kind, mtime, hash, body, indexed_at, distilled_at)
+             SELECT slug, kind, mtime, hash, body, indexed_at, distilled_at FROM memhelper_state_scoped'
+        );
+        $pdo->exec('DROP TABLE memhelper_state_scoped');
+        $pdo->exec('DROP TABLE memhelper_links');
+        $pdo->exec(
+            'CREATE TABLE memhelper_links (
+                from_slug TEXT NOT NULL,
+                to_slug TEXT NOT NULL,
+                PRIMARY KEY (from_slug, to_slug)
+            )'
+        );
         $pdo->exec('DROP TABLE memories');
         $pdo->exec('CREATE VIRTUAL TABLE memories USING fts5(slug UNINDEXED, kind UNINDEXED, title, body)');
         unset($pdo);
@@ -753,8 +1004,9 @@ final class Test extends TestCase
 
         $pdo = new \PDO('sqlite:' . $dbPath);
         $source = $pdo->query(
-            "SELECT body, distilled_at FROM memhelper_state WHERE kind = 'source'"
+            "SELECT scope, body, distilled_at FROM memhelper_state WHERE kind = 'source'"
         )->fetch(\PDO::FETCH_ASSOC);
+        $this->assertSame('', $source['scope']);
         $this->assertSame('Some source text.', $source['body'], 'staged source body must survive the index upgrade');
         $this->assertSame(1700000000, (int) $source['distilled_at'], 'upgrade must not force a re-distillation');
         $this->assertSame(['editor-preferences'], array_column($this->mem()->grab('editor'), 'slug'));

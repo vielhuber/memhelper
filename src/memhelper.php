@@ -43,6 +43,7 @@ final class memhelper
     private ?string $logPath = null;
     private int $maxSourceBytes;
     private int $existingMemoryLimit;
+    private int $injectionMaxBytes;
     private int $aiUnavailableUntil = 0;
     private ?string $compactionPauseSource = null;
     private const AI_CONFIGURATION_RETRY_SECONDS = 3600;
@@ -85,6 +86,7 @@ final class memhelper
         $this->aiConfig = is_array($cfg['ai'] ?? null) ? $cfg['ai'] : [];
         $this->maxSourceBytes = max(1000, (int) ($cfg['max_source_bytes'] ?? 20000));
         $this->existingMemoryLimit = max(0, (int) ($cfg['existing_memory_limit'] ?? 200));
+        $this->injectionMaxBytes = max(1000, (int) ($cfg['injection_max_bytes'] ?? 12000));
 
         // internal database — always sqlite, always lives under .data/ of the
         // output directory. no user-facing config knob, no path-collision risk.
@@ -95,7 +97,17 @@ final class memhelper
         }
         $this->db = new dbhelper();
         $this->db->connect('pdo', 'sqlite', $dbPath);
-        $this->initSchemaSqlite($this->db);
+        $this->db->query('BEGIN IMMEDIATE');
+        try {
+            $this->initSchemaSqlite($this->db);
+            $this->db->query('COMMIT');
+        } catch (\Throwable $exception) {
+            try {
+                $this->db->query('ROLLBACK');
+            } catch (\Throwable) {
+            }
+            throw $exception;
+        }
 
         // input_dbs: list of read-only knowledge sources (mysql/postgres/sqlite).
         // configurations are stored verbatim; connections are opened lazily
@@ -196,21 +208,26 @@ final class memhelper
             maximum: 20,
             default: 10
         )]
-        int $limit = 10
+        int $limit = 10,
+        #[Schema(
+            description: 'Optional exact project scope. Omit it for the global personal memory store.'
+        )]
+        ?string $scope = null
     ): array {
         $query = trim($query);
+        $scope = trim((string) $scope);
         $limit = max(1, min(20, $limit));
         if ($query === '') {
             $this->log('grab: empty query — returning []');
             return [];
         }
-        $hits = $this->search($query, $limit);
-        $neighbours = $this->neighboursOf($hits, max(1, $limit));
+        $hits = $this->search($query, $limit, $scope);
+        $neighbours = $this->neighboursOf($hits, max(1, $limit), $scope);
 
         $results = [];
         foreach ([[$hits, null], [$neighbours, 'link']] as [$candidates, $via]) {
             foreach ($candidates as $slug => $score) {
-                $entry = $this->getMemory($slug);
+                $entry = $this->getMemory($slug, $scope);
                 if ($entry === null || self::isExpired($entry['frontmatter'])) {
                     continue;
                 }
@@ -230,6 +247,76 @@ final class memhelper
             strlen($query), count($hits), count($neighbours), count($results)
         ));
         return $results;
+    }
+
+    /**
+     * Render relevant project facts for direct prompt injection without an AI call.
+     */
+    public function inject(string $scope, string $context = ''): string
+    {
+        $scope = trim($scope);
+        if ($scope === '') {
+            return '';
+        }
+        $context = trim($context);
+        $facts = [];
+        if ($context === '') {
+            $rows = $this->db->fetch_all(
+                'SELECT slug FROM memories
+                 WHERE scope = ? AND (valid_until = ? OR valid_until >= ?)
+                 ORDER BY CAST(updated AS INTEGER) DESC LIMIT ?',
+                $scope,
+                '',
+                date('Y-m-d'),
+                10
+            ) ?: [];
+            foreach ($rows as $row) {
+                $slug = (string) $row['slug'];
+                $entry = $this->getMemory($slug, $scope);
+                if ($entry === null) {
+                    continue;
+                }
+                $facts[] = [
+                    'slug' => $slug,
+                    'tags' => self::readTags($entry['frontmatter']),
+                    'description' => (string) ($entry['frontmatter']['description'] ?? ''),
+                    'body' => trim((string) $entry['body']),
+                    'sources' => self::readSources($entry['frontmatter']),
+                    'score' => 0.0,
+                    'via' => null
+                ];
+            }
+        }
+        if ($context !== '') {
+            $facts = $this->grab($context, 20, $scope);
+        }
+        if ($facts === []) {
+            return '';
+        }
+        $lines = ['# Project memory'];
+        $bytes = strlen($lines[0]);
+        foreach ($facts as $fact) {
+            $description = trim((string) ($fact['description'] ?? ''));
+            $body = trim((string) ($fact['body'] ?? ''));
+            $line = '- ' . ($description !== '' ? '**' . $description . ':** ' : '') . $body;
+            $remaining = $this->injectionMaxBytes - $bytes - 1;
+            if ($remaining <= 0) {
+                break;
+            }
+            if (strlen($line) > $remaining) {
+                $suffix = ' [truncated]';
+                if ($remaining <= strlen($suffix)) {
+                    break;
+                }
+                $line = rtrim(mb_strcut($line, 0, max(0, $remaining - strlen($suffix)))) . $suffix;
+            }
+            $lines[] = $line;
+            $bytes += 1 + strlen($line);
+            if ($bytes >= $this->injectionMaxBytes) {
+                break;
+            }
+        }
+        return count($lines) > 1 ? implode("\n", $lines) : '';
     }
 
     // ====================================================================
@@ -376,7 +463,7 @@ final class memhelper
      * @param array<string, float> $primaryScores
      * @return array<string, float>
      */
-    private function neighboursOf(array $primaryScores, int $maxAdd): array
+    private function neighboursOf(array $primaryScores, int $maxAdd, string $scope = ''): array
     {
         if ($primaryScores === [] || $maxAdd <= 0) {
             return [];
@@ -386,8 +473,8 @@ final class memhelper
         try {
             $rows = $this->db->fetch_all(
                 "SELECT from_slug, to_slug FROM memhelper_links
-                 WHERE from_slug IN ($placeholders) OR to_slug IN ($placeholders)",
-                ...array_merge($primarySlugs, $primarySlugs)
+                 WHERE scope = ? AND (from_slug IN ($placeholders) OR to_slug IN ($placeholders))",
+                ...array_merge([$scope], $primarySlugs, $primarySlugs)
             ) ?: [];
         } catch (\Throwable) {
             return [];
@@ -422,7 +509,7 @@ final class memhelper
      * because both are deliberately curated, the body is prose. The zeros are
      * the UNINDEXED columns; bm25 still expects one weight per column.
      */
-    private const BM25_WEIGHTS = '0.0, 0.0, 3.0, 1.0, 2.0, 0.0, 0.0';
+    private const BM25_WEIGHTS = '0.0, 0.0, 0.0, 3.0, 1.0, 2.0, 0.0, 0.0';
     private const SCORE_WEIGHT_LINKS = 0.15;
     private const SCORE_WEIGHT_RECENCY = 0.15;
     /** Well-connected entries are hubs — cap the boost so a mega-hub cannot
@@ -442,7 +529,7 @@ final class memhelper
      *
      * @return array<string, float> slug => score, best first
      */
-    private function search(string $q, int $limit): array
+    private function search(string $q, int $limit, string $scope = ''): array
     {
         $limit = max(1, $limit);
         $tokens = self::tokenize($q);
@@ -454,9 +541,10 @@ final class memhelper
             $rows = $this->db->fetch_all(
                 'SELECT slug, updated, bm25(memories, ' . self::BM25_WEIGHTS . ') AS rank
                  FROM memories
-                 WHERE memories MATCH ? AND (valid_until = ? OR valid_until >= ?)
+                 WHERE memories MATCH ? AND scope = ? AND (valid_until = ? OR valid_until >= ?)
                  ORDER BY rank LIMIT ?',
                 implode(' OR ', $tokens),
+                $scope,
                 '',
                 date('Y-m-d'),
                 $pool
@@ -479,7 +567,7 @@ final class memhelper
         if ($bestRank === 0.0) {
             $bestRank = -1.0;
         }
-        $degrees = $this->linkDegrees(array_map(static fn(array $r): string => (string) $r['slug'], $rows));
+        $degrees = $this->linkDegrees(array_map(static fn(array $r): string => (string) $r['slug'], $rows), $scope);
         $now = time();
         $scored = [];
         foreach ($rows as $r) {
@@ -506,7 +594,7 @@ final class memhelper
      * @param list<string> $slugs
      * @return array<string, int>
      */
-    private function linkDegrees(array $slugs): array
+    private function linkDegrees(array $slugs, string $scope = ''): array
     {
         if ($slugs === []) {
             return [];
@@ -515,11 +603,11 @@ final class memhelper
         try {
             $rows = $this->db->fetch_all(
                 "SELECT slug, COUNT(*) AS degree FROM (
-                     SELECT from_slug AS slug FROM memhelper_links WHERE from_slug IN ($placeholders)
+                     SELECT from_slug AS slug FROM memhelper_links WHERE scope = ? AND from_slug IN ($placeholders)
                      UNION ALL
-                     SELECT to_slug AS slug FROM memhelper_links WHERE to_slug IN ($placeholders)
+                     SELECT to_slug AS slug FROM memhelper_links WHERE scope = ? AND to_slug IN ($placeholders)
                  ) GROUP BY slug",
-                ...array_merge($slugs, $slugs)
+                ...array_merge([$scope], $slugs, [$scope], $slugs)
             ) ?: [];
         } catch (\Throwable) {
             return [];
@@ -595,7 +683,16 @@ final class memhelper
                 distilled_at INTEGER
             )'
         );
+        try {
+            $db->fetch_var('SELECT scope FROM memhelper_state LIMIT 0');
+        } catch (\Throwable) {
+            $db->query("ALTER TABLE memhelper_state ADD COLUMN scope TEXT NOT NULL DEFAULT ''");
+        }
         $db->query('CREATE INDEX IF NOT EXISTS memhelper_state_kind ON memhelper_state(kind)');
+        $db->query(
+            'CREATE INDEX IF NOT EXISTS memhelper_state_kind_scope_indexed
+             ON memhelper_state(kind, scope, indexed_at)'
+        );
         // memhelper_meta: singleton-ish bookkeeping that does not belong to a
         // single slug. used for the tick lock (key=tick_lock, value=pid,
         // updated_at=when-acquired) and the compaction sentinel (key=last_compact,
@@ -612,14 +709,24 @@ final class memhelper
         // 1-hop expansion at search time so a hit on one entry surfaces its
         // neighbours too. one row per directed edge — duplicates collapse
         // via the composite primary key.
+        try {
+            $db->fetch_var('SELECT scope FROM memhelper_links LIMIT 0');
+        } catch (\Throwable) {
+            $db->query('DROP TABLE IF EXISTS memhelper_links');
+        }
         $db->query(
             'CREATE TABLE IF NOT EXISTS memhelper_links (
+                scope TEXT NOT NULL,
                 from_slug TEXT NOT NULL,
                 to_slug TEXT NOT NULL,
-                PRIMARY KEY (from_slug, to_slug)
+                PRIMARY KEY (scope, from_slug, to_slug)
             )'
         );
         $db->query('CREATE INDEX IF NOT EXISTS memhelper_links_to ON memhelper_links(to_slug)');
+        $db->query(
+            'CREATE INDEX IF NOT EXISTS memhelper_links_scope_to
+             ON memhelper_links(scope, to_slug)'
+        );
         // memories: ONLY curated md entries (kind='memory'). sources never
         // land here — they are read by the ai during distillation, then the
         // resulting memory entries get indexed. `tags` is indexed so a tag
@@ -632,7 +739,7 @@ final class memhelper
         // matching state rows is what makes refreshMemoryIndex() rebuild
         // them; source rows keep their bodies and their distilled_at.
         try {
-            $db->fetch_var('SELECT tags, updated, valid_until FROM memories LIMIT 0');
+            $db->fetch_var('SELECT scope, tags, updated, valid_until FROM memories LIMIT 0');
         } catch (\Throwable) {
             $db->query('DROP TABLE IF EXISTS memories');
             try {
@@ -642,7 +749,7 @@ final class memhelper
             }
         }
         $db->query(
-            'CREATE VIRTUAL TABLE IF NOT EXISTS memories USING fts5(slug UNINDEXED, kind UNINDEXED, title, body, tags, updated UNINDEXED, valid_until UNINDEXED, tokenize="unicode61 remove_diacritics 2")'
+            'CREATE VIRTUAL TABLE IF NOT EXISTS memories USING fts5(slug UNINDEXED, scope UNINDEXED, kind UNINDEXED, title, body, tags, updated UNINDEXED, valid_until UNINDEXED, tokenize="unicode61 remove_diacritics 2")'
         );
     }
 
@@ -650,11 +757,21 @@ final class memhelper
      * @param array<string, mixed> $frontmatter the entry's parsed frontmatter;
      *   supplies tags, `updated` and `valid_until` for the index columns.
      */
-    private function writeEntry(string $slug, string $kind, string $title, string $body, int $mtime, array $frontmatter = []): void
+    private function writeEntry(
+        string $slug,
+        string $kind,
+        string $title,
+        string $body,
+        int $mtime,
+        array $frontmatter = [],
+        string $scope = ''
+    ): void
     {
-        $this->db->delete('memories', ['slug' => $slug]);
+        $stateSlug = self::stateSlug($slug, $scope);
+        $this->db->delete('memories', ['slug' => $slug, 'scope' => $scope]);
         $this->db->insert('memories', [
             'slug' => $slug,
+            'scope' => $scope,
             'kind' => $kind,
             'title' => $title,
             'body' => $body,
@@ -662,15 +779,16 @@ final class memhelper
             'updated' => (string) self::readUpdated($frontmatter, $mtime),
             'valid_until' => self::readValidUntil($frontmatter)
         ]);
-        $this->db->delete('memhelper_state', ['slug' => $slug]);
+        $this->db->delete('memhelper_state', ['slug' => $stateSlug]);
         $this->db->insert('memhelper_state', [
-            'slug' => $slug,
+            'slug' => $stateSlug,
+            'scope' => $scope,
             'kind' => $kind,
             'mtime' => $mtime,
             'hash' => self::memoryHash($frontmatter, $body),
             'indexed_at' => time()
         ]);
-        $this->upsertLinks($slug, $body);
+        $this->upsertLinks($slug, $body, $scope);
     }
 
     /**
@@ -689,14 +807,14 @@ final class memhelper
         ]));
     }
 
-    private function removeEntry(string $slug): void
+    private function removeEntry(string $slug, string $scope = ''): void
     {
-        $this->db->delete('memories', ['slug' => $slug]);
-        $this->db->delete('memhelper_state', ['slug' => $slug]);
+        $this->db->delete('memories', ['slug' => $slug, 'scope' => $scope]);
+        $this->db->delete('memhelper_state', ['slug' => self::stateSlug($slug, $scope)]);
         // remove edges in both directions — a deleted entry stops being a
         // source and stops being a target.
-        $this->db->delete('memhelper_links', ['from_slug' => $slug]);
-        $this->db->delete('memhelper_links', ['to_slug' => $slug]);
+        $this->db->delete('memhelper_links', ['scope' => $scope, 'from_slug' => $slug]);
+        $this->db->delete('memhelper_links', ['scope' => $scope, 'to_slug' => $slug]);
     }
 
     /**
@@ -705,9 +823,9 @@ final class memhelper
      * slugs are dropped — the latter keeps a forward reference to a not-yet-
      * existing memory cheap to fix later (just add the missing md).
      */
-    private function upsertLinks(string $slug, string $body): void
+    private function upsertLinks(string $slug, string $body, string $scope = ''): void
     {
-        $this->db->delete('memhelper_links', ['from_slug' => $slug]);
+        $this->db->delete('memhelper_links', ['scope' => $scope, 'from_slug' => $slug]);
         $targets = self::parseLinkTargets($body);
         foreach ($targets as $target) {
             if ($target === $slug || !self::isValidSlug($target)) {
@@ -715,6 +833,7 @@ final class memhelper
             }
             try {
                 $this->db->insert('memhelper_links', [
+                    'scope' => $scope,
                     'from_slug' => $slug,
                     'to_slug' => $target
                 ]);
@@ -763,16 +882,23 @@ final class memhelper
      */
     private function purgeOrphans(): int
     {
-        $known = $this->db->fetch_col('SELECT slug FROM memhelper_state') ?: [];
-        $present = $this->db->fetch_col('SELECT slug FROM memories') ?: [];
-        $orphans = array_diff(
-            array_map('strval', $present),
-            array_map('strval', $known)
-        );
-        foreach ($orphans as $slug) {
-            $this->db->delete('memories', ['slug' => $slug]);
+        $stateRows = $this->db->fetch_all("SELECT slug, scope FROM memhelper_state WHERE kind = 'memory'") ?: [];
+        $known = [];
+        foreach ($stateRows as $row) {
+            $known[(string) $row['slug']] = true;
         }
-        return count($orphans);
+        $present = $this->db->fetch_all('SELECT slug, scope FROM memories') ?: [];
+        $orphans = 0;
+        foreach ($present as $row) {
+            $slug = (string) $row['slug'];
+            $scope = (string) ($row['scope'] ?? '');
+            if (isset($known[self::stateSlug($slug, $scope)])) {
+                continue;
+            }
+            $this->db->delete('memories', ['slug' => $slug, 'scope' => $scope]);
+            $orphans++;
+        }
+        return $orphans;
     }
 
     // ====================================================================
@@ -823,7 +949,29 @@ final class memhelper
             if (!self::isValidSlug($slug)) {
                 continue;
             }
-            $desired[$slug] = ['path' => $file, 'mtime' => (int) filemtime($file)];
+            $desired[self::stateSlug($slug, '')] = [
+                'slug' => $slug,
+                'scope' => '',
+                'path' => $file,
+                'mtime' => (int) filemtime($file)
+            ];
+        }
+        foreach (glob($this->output . '/.scopes/*/*.md') ?: [] as $file) {
+            $slug = basename($file, '.md');
+            if (!self::isValidSlug($slug)) {
+                continue;
+            }
+            [$frontmatter] = self::splitFrontmatter((string) file_get_contents($file));
+            $scope = trim((string) ($frontmatter['scope'] ?? ''));
+            if ($scope === '' || basename(dirname($file)) !== hash('sha256', $scope)) {
+                continue;
+            }
+            $desired[self::stateSlug($slug, $scope)] = [
+                'slug' => $slug,
+                'scope' => $scope,
+                'path' => $file,
+                'mtime' => (int) filemtime($file)
+            ];
         }
 
         // one-shot link backfill: the diff path below only re-parses entries
@@ -835,37 +983,47 @@ final class memhelper
         $linkRows = (int) ($this->db->fetch_var('SELECT COUNT(*) FROM memhelper_links') ?? 0);
         if ($linkRows === 0 && $desired !== []) {
             $seeded = 0;
-            foreach ($desired as $slug => $info) {
+            foreach ($desired as $info) {
                 $raw = (string) file_get_contents($info['path']);
                 [, $body] = self::splitFrontmatter($raw);
-                $this->upsertLinks($slug, $body);
+                $this->upsertLinks($info['slug'], $body, $info['scope']);
                 $seeded++;
             }
             $this->log("memory-index: seeded link table from {$seeded} existing memory file(s)");
         }
 
-        $rows = $this->db->fetch_all("SELECT slug, mtime, hash FROM memhelper_state WHERE kind = ?", 'memory') ?: [];
+        $rows = $this->db->fetch_all("SELECT slug, scope, mtime, hash FROM memhelper_state WHERE kind = ?", 'memory') ?: [];
         $current = [];
         foreach ($rows as $r) {
-            $current[(string) $r['slug']] = ['mtime' => (int) $r['mtime'], 'hash' => (string) $r['hash']];
+            $stateSlug = (string) $r['slug'];
+            $scope = (string) ($r['scope'] ?? '');
+            $scopePrefix = $scope === '' ? '' : 'scoped:' . hash('sha256', $scope) . ':';
+            $current[$stateSlug] = [
+                'slug' => $scopePrefix !== '' && str_starts_with($stateSlug, $scopePrefix)
+                    ? substr($stateSlug, strlen($scopePrefix))
+                    : $stateSlug,
+                'scope' => $scope,
+                'mtime' => (int) $r['mtime'],
+                'hash' => (string) $r['hash']
+            ];
         }
 
         $toAdd = [];
         $toUpdate = [];
         $toRemove = [];
         $unchanged = 0;
-        foreach ($desired as $slug => $info) {
-            if (!isset($current[$slug])) {
-                $toAdd[] = $slug;
-            } elseif ($current[$slug]['mtime'] !== $info['mtime']) {
-                $toUpdate[] = $slug;
+        foreach ($desired as $stateSlug => $info) {
+            if (!isset($current[$stateSlug])) {
+                $toAdd[] = $stateSlug;
+            } elseif ($current[$stateSlug]['mtime'] !== $info['mtime']) {
+                $toUpdate[] = $stateSlug;
             } else {
                 $unchanged++;
             }
         }
-        foreach (array_keys($current) as $slug) {
-            if (!isset($desired[$slug])) {
-                $toRemove[] = $slug;
+        foreach (array_keys($current) as $stateSlug) {
+            if (!isset($desired[$stateSlug])) {
+                $toRemove[] = $stateSlug;
             }
         }
 
@@ -882,37 +1040,54 @@ final class memhelper
         $done = 0;
         $tag = 'memory-index';
 
-        foreach ($toRemove as $slug) {
-            $this->removeEntry($slug);
+        foreach ($toRemove as $stateSlug) {
+            $info = $current[$stateSlug];
+            $this->removeEntry($info['slug'], $info['scope']);
             $done++;
-            $this->progress($tag, $done, $total, "removed $slug");
+            $this->progress($tag, $done, $total, 'removed ' . $info['slug']);
         }
-        foreach ($toAdd as $slug) {
-            $info = $desired[$slug];
+        foreach ($toAdd as $stateSlug) {
+            $info = $desired[$stateSlug];
             $raw = (string) file_get_contents($info['path']);
             [$fm, $body] = self::splitFrontmatter($raw);
-            $this->writeEntry($slug, 'memory', (string) ($fm['description'] ?? ''), $body, $info['mtime'], $fm);
+            $this->writeEntry(
+                $info['slug'],
+                'memory',
+                (string) ($fm['description'] ?? ''),
+                $body,
+                $info['mtime'],
+                $fm,
+                $info['scope']
+            );
             $done++;
-            $this->progress($tag, $done, $total, "added $slug");
+            $this->progress($tag, $done, $total, 'added ' . $info['slug']);
         }
-        foreach ($toUpdate as $slug) {
-            $info = $desired[$slug];
+        foreach ($toUpdate as $stateSlug) {
+            $info = $desired[$stateSlug];
             $raw = (string) file_get_contents($info['path']);
             [$fm, $body] = self::splitFrontmatter($raw);
             $hash = self::memoryHash($fm, $body);
-            if ($hash === $current[$slug]['hash']) {
+            if ($hash === $current[$stateSlug]['hash']) {
                 $this->db->update(
                     'memhelper_state',
                     ['mtime' => $info['mtime'], 'indexed_at' => time()],
-                    ['slug' => $slug]
+                    ['slug' => $stateSlug]
                 );
                 $done++;
-                $this->progress($tag, $done, $total, "touched $slug (mtime-only)");
+                $this->progress($tag, $done, $total, 'touched ' . $info['slug'] . ' (mtime-only)');
                 continue;
             }
-            $this->writeEntry($slug, 'memory', (string) ($fm['description'] ?? ''), $body, $info['mtime'], $fm);
+            $this->writeEntry(
+                $info['slug'],
+                'memory',
+                (string) ($fm['description'] ?? ''),
+                $body,
+                $info['mtime'],
+                $fm,
+                $info['scope']
+            );
             $done++;
-            $this->progress($tag, $done, $total, "updated $slug");
+            $this->progress($tag, $done, $total, 'updated ' . $info['slug']);
         }
         $this->log(sprintf('memory-index: complete in %.2fs', microtime(true) - $tStart));
     }
@@ -1117,6 +1292,15 @@ final class memhelper
             if ($source === null) {
                 continue;
             }
+            $query = trim((string) ($dbc['query'] ?? ''));
+            if ($query !== '') {
+                try {
+                    $this->refreshDbQuery($source, $alias, $dbc, $query);
+                } catch (\Throwable $exception) {
+                    $this->log("input_dbs[$alias]: query source failed — " . $exception->getMessage(), 'WARN');
+                }
+                continue;
+            }
             try {
                 $tables = $this->discoverTables($source, $dbc);
             } catch (\Throwable $e) {
@@ -1247,8 +1431,9 @@ final class memhelper
 
     private function deriveAlias(array $dbc, array $used): string
     {
+        $configured = self::aliasSlug((string) ($dbc['key'] ?? ''));
         $driver = strtolower((string) ($dbc['driver'] ?? ''));
-        $base = match ($driver) {
+        $base = $configured !== '' ? $configured : match ($driver) {
             'sqlite' => self::aliasSlug(pathinfo((string) ($dbc['path'] ?? 'db'), PATHINFO_FILENAME)),
             'mysql', 'postgres' => self::aliasSlug((string) ($dbc['database'] ?? ($dbc['host'] ?? 'db'))),
             default => 'db',
@@ -1262,6 +1447,117 @@ final class memhelper
             $alias = $base . '-' . $i++;
         }
         return $alias;
+    }
+
+    /**
+     * Stage rows from an explicit read-only query with a deterministic project scope.
+     */
+    private function refreshDbQuery(dbhelper $source, string $alias, array $config, string $query): void
+    {
+        if (str_contains($query, ';') || preg_match('/^\s*(SELECT|WITH)\b/i', $query) !== 1) {
+            throw new RuntimeException('query must be a single SELECT statement without semicolons');
+        }
+        $primaryKey = trim((string) ($config['primary_key'] ?? ''));
+        $scopeColumn = trim((string) ($config['scope_column'] ?? ''));
+        $contentColumns = is_array($config['content_columns'] ?? null)
+            ? array_values(array_map('strval', $config['content_columns']))
+            : [];
+        foreach ([$primaryKey, $scopeColumn, ...$contentColumns] as $column) {
+            if (preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $column) !== 1) {
+                throw new RuntimeException('primary_key, scope_column and content_columns must be valid column names');
+            }
+        }
+        if ($primaryKey === '' || $scopeColumn === '' || $contentColumns === []) {
+            throw new RuntimeException('primary_key, scope_column and content_columns are required for query sources');
+        }
+
+        $rows = $source->fetch_all(
+            'SELECT * FROM (' . $query . ') AS memhelper_source LIMIT ' . (self::DB_TABLE_ROW_CAP + 1)
+        ) ?: [];
+        if (count($rows) > self::DB_TABLE_ROW_CAP) {
+            throw new RuntimeException('query returned more than ' . self::DB_TABLE_ROW_CAP . ' rows');
+        }
+
+        $prefix = 'dbquery:' . $alias . ':';
+        $stateRows = $this->db->fetch_all(
+            "SELECT slug, scope, hash FROM memhelper_state WHERE kind = 'source' AND slug LIKE ?",
+            $prefix . '%'
+        ) ?: [];
+        $current = [];
+        foreach ($stateRows as $stateRow) {
+            $current[(string) $stateRow['slug']] = [
+                'scope' => (string) ($stateRow['scope'] ?? ''),
+                'hash' => (string) $stateRow['hash']
+            ];
+        }
+
+        $desired = [];
+        foreach ($rows as $row) {
+            $primaryValue = $row[$primaryKey] ?? null;
+            $scope = trim((string) ($row[$scopeColumn] ?? ''));
+            if ($primaryValue === null || $primaryValue === '' || $scope === '') {
+                continue;
+            }
+            $parts = [];
+            foreach ($contentColumns as $column) {
+                $value = $row[$column] ?? null;
+                if ($value === null || $value === '') {
+                    continue;
+                }
+                $parts[] = $column . ': ' . (string) $value;
+            }
+            if ($parts === []) {
+                continue;
+            }
+            $slug = $prefix . (string) $primaryValue;
+            $body = implode("\n", $parts);
+            $desired[$slug] = [
+                'scope' => $scope,
+                'body' => $body,
+                'hash' => sha1($scope . "\0" . $body)
+            ];
+        }
+
+        $removed = 0;
+        foreach (array_keys($current) as $slug) {
+            if (isset($desired[$slug])) {
+                continue;
+            }
+            $this->db->delete('memhelper_state', ['slug' => $slug]);
+            $removed++;
+        }
+        $added = 0;
+        $updated = 0;
+        $unchanged = 0;
+        foreach ($desired as $slug => $row) {
+            if (isset($current[$slug]) && $current[$slug]['hash'] === $row['hash']) {
+                $unchanged++;
+                continue;
+            }
+            if (isset($current[$slug])) {
+                $this->db->delete('memhelper_state', ['slug' => $slug]);
+                $updated++;
+            } else {
+                $added++;
+            }
+            $this->db->insert('memhelper_state', [
+                'slug' => $slug,
+                'scope' => $row['scope'],
+                'kind' => 'source',
+                'mtime' => time(),
+                'hash' => $row['hash'],
+                'body' => $row['body'],
+                'indexed_at' => time()
+            ]);
+        }
+        $this->log(sprintf(
+            'input_dbs[%s]: query source complete — add=%d update=%d remove=%d unchanged=%d',
+            $alias,
+            $added,
+            $updated,
+            $removed,
+            $unchanged
+        ));
     }
 
     private static function aliasSlug(string $s): string
@@ -1666,10 +1962,10 @@ final class memhelper
             return;
         }
         $sources = $this->db->fetch_all(
-            "SELECT slug, body FROM memhelper_state
+            "SELECT slug, scope, body FROM memhelper_state
              WHERE kind = 'source' AND hash != ?
                AND (distilled_at IS NULL OR distilled_at < indexed_at)
-             ORDER BY indexed_at ASC",
+             ORDER BY scope ASC, indexed_at ASC",
             self::SKIPPED_HASH
         ) ?: [];
         if ($sources === []) {
@@ -1749,7 +2045,12 @@ final class memhelper
                     ? 'INFO'
                     : 'WARN'
             );
-            $this->applyDiff($diff, array_column($batch, 'slug'));
+            $this->applyDiff(
+                $diff,
+                array_column($batch, 'slug'),
+                [],
+                (string) ($batch[0]['scope'] ?? '')
+            );
             // mark as distilled regardless of action count — an empty diff is
             // a valid answer ("nothing in this source is worth saving") and
             // shouldn't keep coming back to the ai on every tick.
@@ -1758,7 +2059,7 @@ final class memhelper
         $this->log(sprintf('distill: complete in %.2fs', microtime(true) - $tStart));
     }
 
-    /** @param list<array{slug:string,label:string,body:string}> $batch */
+    /** @param list<array{slug:string,scope:string,label:string,body:string}> $batch */
     private function markDistilled(array $batch): void
     {
         foreach ($batch as $item) {
@@ -1775,32 +2076,41 @@ final class memhelper
      * grouping logic.
      *
      * @param list<array<string, mixed>> $rows
-     * @return list<list<array{slug:string,label:string,body:string}>>
+     * @return list<list<array{slug:string,scope:string,label:string,body:string}>>
      */
     private function batchSources(array $rows): array
     {
         $batches = [];
         $batch = [];
         $bytes = 0;
+        $batchScope = null;
         foreach ($rows as $row) {
             $body = (string) $row['body'];
+            $scope = trim((string) ($row['scope'] ?? ''));
             if (strlen($body) > $this->maxSourceBytes) {
                 $body = mb_strcut($body, 0, $this->maxSourceBytes) . "\n\n[truncated]";
             }
             if (
                 $batch !== [] &&
-                ($bytes + strlen($body) > $this->maxSourceBytes || count($batch) >= self::DISTILL_BATCH_MAX_ITEMS)
+                (
+                    $batchScope !== $scope ||
+                    $bytes + strlen($body) > $this->maxSourceBytes ||
+                    count($batch) >= self::DISTILL_BATCH_MAX_ITEMS
+                )
             ) {
                 $batches[] = $batch;
                 $batch = [];
                 $bytes = 0;
+                $batchScope = null;
             }
             $slug = (string) $row['slug'];
             $batch[] = [
                 'slug' => $slug,
+                'scope' => $scope,
                 'label' => (string) (self::slugToPath($slug) ?? $slug),
                 'body' => $body
             ];
+            $batchScope = $scope;
             $bytes += strlen($body);
         }
         if ($batch !== []) {
@@ -1814,12 +2124,13 @@ final class memhelper
      * prompt and returns a tuple of the decoded diff array AND the raw ai
      * response (for diagnostic logging by the caller).
      *
-     * @param list<array{slug:string,label:string,body:string}> $batch
+     * @param list<array{slug:string,scope:string,label:string,body:string}> $batch
      * @return array{0: list<array<string, mixed>>, 1: string}
      */
     private function distillBatch(array $batch): array
     {
-        $existing = array_slice($this->listMemories(), 0, $this->existingMemoryLimit);
+        $scope = (string) ($batch[0]['scope'] ?? '');
+        $existing = array_slice($this->listMemories($scope), 0, $this->existingMemoryLimit);
         $indexLines = array_map(
             function (array $e): string {
                 $tagSuffix = empty($e['tags']) ? '' : ' [' . implode(', ', $e['tags']) . ']';
@@ -1909,51 +2220,57 @@ final class memhelper
             $this->log('compact: ai not configured — skipping', 'WARN');
             return;
         }
-        $entries = $this->loadMemoryEntries();
-        if ($entries === []) {
+        $scopes = array_map(
+            'strval',
+            $this->db->fetch_col('SELECT DISTINCT scope FROM memories ORDER BY scope') ?: []
+        );
+        if ($scopes === []) {
             $this->log('compact: no memory files to evaluate');
             return;
         }
-        $batches = $this->clusterMemories($entries);
-        $this->log(sprintf(
-            'compact: evaluating %d memory entries in %d cluster batch(es)',
-            count($entries), count($batches)
-        ));
-        $stamp = 'compact:' . date('c');
-        foreach ($batches as $i => $batch) {
-            $blocks = array_map(
-                static function (array $e): string {
-                    return '## ' . $e['slug'] .
-                        ($e['tags'] === [] ? '' : ' (tags: ' . implode(', ', $e['tags']) . ')') .
-                        "\nDescription: " . $e['description'] .
-                        "\n\n" . $e['body'];
-                },
-                $batch
-            );
-            $prompt =
-                "You curate a durable long-term memory store for an LLM assistant. Below is one topical cluster of the store. Do five things:\n" .
-                "  1. PURGE TRANSIENT DATA: emit `delete` for one-off research results, individual vacancies or search hits, generated document contents, implementation progress, test/build results, logs, transient errors, temporary paths and current-run status. Preserve stable preferences, recurring rules and durable decisions even when they originated in those conversations.\n" .
-                "  2. DEDUPE + MERGE: identify duplicates, contradictions and obsolete facts — collapse overlapping entries into one canonical entry and delete superseded entries.\n" .
-                "  3. ADD MISSING CROSS-REFERENCES: whenever an entry mentions an entity that already has its own slug, emit an `update` action whose `content` is the original body with `[[that-slug]]` inserted at the right places. If many entries clearly share an umbrella concept but no hub entry exists yet, add one and link all members from it.\n" .
-                "  4. PRESERVE every valid existing `[[slug]]` cross-reference when rewriting bodies — those links power 1-hop expansion at retrieval time. Slugs outside this cluster still exist; never delete a `[[…]]` just because its target is not shown here.\n" .
-                "  5. PRESERVE the original language of each entry — never translate.\n\n" .
-                implode("\n\n---\n\n", $blocks) .
-                "\n\nReturn a JSON array of actions using the same schema as the extract step (action is add, update or delete; slug, content, description, tags, optional valid_until). Only act on the entries shown above. Delete actions only require action and slug. `tags` is a list of lower-case keyword strings — keep, narrow or extend the existing tag set when rewriting; do not invent unrelated tags. Respond with raw JSON only, no markdown fences.";
-            $tStart = microtime(true);
-            try {
-                $raw = $this->callAi($prompt);
-            } catch (\Throwable $e) {
-                $this->log(sprintf('compact: cluster batch %d ai call failed — %s', $i + 1, $e->getMessage()), 'ERROR');
-                continue;
-            }
-            $diff = self::decodeDiff($raw);
+        foreach ($scopes as $scope) {
+            $entries = $this->loadMemoryEntries($scope);
+            $batches = $this->clusterMemories($entries);
             $this->log(sprintf(
-                'compact: cluster batch %d/%d (%d entries) responded in %.2fs, decoded %d action(s)',
-                $i + 1, count($batches), count($batch), microtime(true) - $tStart, count($diff)
+                'compact: evaluating %d memory entries in %d cluster batch(es), scope=%s',
+                count($entries), count($batches), $scope === '' ? 'global' : $scope
             ));
-            $this->applyDiff($diff, [$stamp]);
+            $stamp = 'compact:' . date('c');
+            foreach ($batches as $i => $batch) {
+                $blocks = array_map(
+                    static function (array $e): string {
+                        return '## ' . $e['slug'] .
+                            ($e['tags'] === [] ? '' : ' (tags: ' . implode(', ', $e['tags']) . ')') .
+                            "\nDescription: " . $e['description'] .
+                            "\n\n" . $e['body'];
+                    },
+                    $batch
+                );
+                $prompt =
+                    "You curate a durable long-term memory store for an LLM assistant. Below is one topical cluster of the store. Do five things:\n" .
+                    "  1. PURGE TRANSIENT DATA: emit `delete` for one-off research results, individual vacancies or search hits, generated document contents, implementation progress, test/build results, logs, transient errors, temporary paths and current-run status. Preserve stable preferences, recurring rules and durable decisions even when they originated in those conversations.\n" .
+                    "  2. DEDUPE + MERGE: identify duplicates, contradictions and obsolete facts — collapse overlapping entries into one canonical entry and delete superseded entries.\n" .
+                    "  3. ADD MISSING CROSS-REFERENCES: whenever an entry mentions an entity that already has its own slug, emit an `update` action whose `content` is the original body with `[[that-slug]]` inserted at the right places. If many entries clearly share an umbrella concept but no hub entry exists yet, add one and link all members from it.\n" .
+                    "  4. PRESERVE every valid existing `[[slug]]` cross-reference when rewriting bodies — those links power 1-hop expansion at retrieval time. Slugs outside this cluster still exist; never delete a `[[…]]` just because its target is not shown here.\n" .
+                    "  5. PRESERVE the original language of each entry — never translate.\n\n" .
+                    implode("\n\n---\n\n", $blocks) .
+                    "\n\nReturn a JSON array of actions using the same schema as the extract step (action is add, update or delete; slug, content, description, tags, optional valid_until). Only act on the entries shown above. Delete actions only require action and slug. `tags` is a list of lower-case keyword strings — keep, narrow or extend the existing tag set when rewriting; do not invent unrelated tags. Respond with raw JSON only, no markdown fences.";
+                $tStart = microtime(true);
+                try {
+                    $raw = $this->callAi($prompt);
+                } catch (\Throwable $e) {
+                    $this->log(sprintf('compact: cluster batch %d ai call failed — %s', $i + 1, $e->getMessage()), 'ERROR');
+                    continue;
+                }
+                $diff = self::decodeDiff($raw);
+                $this->log(sprintf(
+                    'compact: cluster batch %d/%d (%d entries) responded in %.2fs, decoded %d action(s)',
+                    $i + 1, count($batches), count($batch), microtime(true) - $tStart, count($diff)
+                ));
+                $this->applyDiff($diff, [$stamp], [], $scope);
+            }
+            $this->compactHubPass($stamp, $scope);
         }
-        $this->compactHubPass($stamp);
     }
 
     /**
@@ -1961,9 +2278,9 @@ final class memhelper
      * body, so it may only retire entries or introduce a hub — every write to
      * an existing entry is rejected by applyDiff().
      */
-    private function compactHubPass(string $stamp): void
+    private function compactHubPass(string $stamp, string $scope = ''): void
     {
-        $entries = $this->loadMemoryEntries();
+        $entries = $this->loadMemoryEntries($scope);
         if ($entries === []) {
             return;
         }
@@ -1994,16 +2311,19 @@ final class memhelper
             'compact: hub pass over %d entries responded in %.2fs, decoded %d action(s)',
             count($entries), microtime(true) - $tStart, count($diff)
         ));
-        $this->applyDiff($diff, [$stamp], array_column($entries, 'slug'));
+        $this->applyDiff($diff, [$stamp], array_column($entries, 'slug'), $scope);
     }
 
     /**
      * @return list<array{slug:string,description:string,tags:list<string>,body:string,links:list<string>}>
      */
-    private function loadMemoryEntries(): array
+    private function loadMemoryEntries(string $scope = ''): array
     {
         $out = [];
-        foreach (glob($this->output . '/*.md') ?: [] as $file) {
+        $pattern = $scope === ''
+            ? $this->output . '/*.md'
+            : dirname($this->pathForSlug('placeholder', $scope)) . '/*.md';
+        foreach (glob($pattern) ?: [] as $file) {
             $slug = basename($file, '.md');
             if (!self::isValidSlug($slug)) {
                 continue;
@@ -2168,7 +2488,12 @@ final class memhelper
      *   these slugs are dropped — used by the hub pass, which only ever sees
      *   slugs and descriptions and must not overwrite a body it never read.
      */
-    private function applyDiff(array $diff, array $sources = [], array $protectedSlugs = []): void
+    private function applyDiff(
+        array $diff,
+        array $sources = [],
+        array $protectedSlugs = [],
+        string $scope = ''
+    ): void
     {
         foreach ($diff as $action) {
             $a = (string) ($action['action'] ?? 'skip');
@@ -2195,9 +2520,10 @@ final class memhelper
                         $actionSources,
                         isset($action['valid_until']) && is_scalar($action['valid_until'])
                             ? (string) $action['valid_until']
-                            : null
+                            : null,
+                        $scope
                     ),
-                    'delete' => $this->deleteMemory($slug),
+                    'delete' => $this->deleteMemory($slug, $scope),
                     default => null
                 };
                 $this->log(sprintf('diff: %s %s', $a, $slug));
@@ -2330,23 +2656,25 @@ final class memhelper
      */
     private function expireMemories(): void
     {
-        $slugs = $this->db->fetch_col(
-            'SELECT slug FROM memories WHERE valid_until != ? AND valid_until < ?',
+        $rows = $this->db->fetch_all(
+            'SELECT slug, scope FROM memories WHERE valid_until != ? AND valid_until < ?',
             '',
             date('Y-m-d')
         ) ?: [];
-        if ($slugs === []) {
+        if ($rows === []) {
             return;
         }
-        foreach ($slugs as $slug) {
+        foreach ($rows as $row) {
+            $slug = (string) $row['slug'];
+            $scope = (string) ($row['scope'] ?? '');
             try {
-                $this->deleteMemory((string) $slug);
+                $this->deleteMemory($slug, $scope);
                 $this->log('expire: dropped ' . $slug . ' (valid_until passed)');
             } catch (RuntimeException $e) {
                 $this->log('expire: ' . $slug . ' failed — ' . $e->getMessage(), 'WARN');
             }
         }
-        $this->log(sprintf('expire: removed %d expired entry/entries', count($slugs)));
+        $this->log(sprintf('expire: removed %d expired entry/entries', count($rows)));
     }
 
     // ====================================================================
@@ -2368,10 +2696,15 @@ final class memhelper
         ?string $description,
         ?array $tags,
         array $sources = [],
-        ?string $validUntil = null
+        ?string $validUntil = null,
+        string $scope = ''
     ): void {
         self::assertValidSlug($slug);
-        $path = $this->pathForSlug($slug);
+        $path = $this->pathForSlug($slug, $scope);
+        $directory = dirname($path);
+        if (!is_dir($directory) && !mkdir($directory, 0775, true) && !is_dir($directory)) {
+            throw new RuntimeException('memhelper: failed to create memory scope directory: ' . $directory);
+        }
         $existing = is_file($path) ? self::splitFrontmatter((string) file_get_contents($path))[0] : [];
         if ($tags === null) {
             $tags = self::readTags($existing);
@@ -2403,6 +2736,9 @@ final class memhelper
             'description' => $description ?? ($existing['description'] ?? ''),
             'metadata' => $metadata
         ];
+        if ($scope !== '') {
+            $frontmatter['scope'] = $scope;
+        }
         $serialized = self::renderFrontmatter($frontmatter) . trim($content) . "\n";
         if (file_put_contents($path, $serialized) === false) {
             throw new RuntimeException('memhelper: failed to write memory file: ' . $path);
@@ -2415,27 +2751,28 @@ final class memhelper
             (string) ($frontmatter['description'] ?? ''),
             trim($content),
             (int) filemtime($path),
-            $frontmatter
+            $frontmatter,
+            $scope
         );
     }
 
-    private function deleteMemory(string $slug): bool
+    private function deleteMemory(string $slug, string $scope = ''): bool
     {
         self::assertValidSlug($slug);
-        $path = $this->pathForSlug($slug);
+        $path = $this->pathForSlug($slug, $scope);
         if (!is_file($path)) {
             return false;
         }
         if (!@unlink($path)) {
             throw new RuntimeException('memhelper: failed to delete memory file: ' . $path);
         }
-        $this->removeEntry($slug);
+        $this->removeEntry($slug, $scope);
         return true;
     }
 
-    private function getMemory(string $slug): ?array
+    private function getMemory(string $slug, string $scope = ''): ?array
     {
-        $path = $this->pathForSlug($slug);
+        $path = $this->pathForSlug($slug, $scope);
         if (!is_file($path)) {
             return null;
         }
@@ -2444,10 +2781,13 @@ final class memhelper
         return ['slug' => $slug, 'frontmatter' => $fm, 'body' => $body];
     }
 
-    private function listMemories(): array
+    private function listMemories(string $scope = ''): array
     {
         $out = [];
-        foreach (glob($this->output . '/*.md') ?: [] as $file) {
+        $pattern = $scope === ''
+            ? $this->output . '/*.md'
+            : dirname($this->pathForSlug('placeholder', $scope)) . '/*.md';
+        foreach (glob($pattern) ?: [] as $file) {
             $head = (string) file_get_contents($file, false, null, 0, 4096);
             [$fm] = self::splitFrontmatter($head);
             $out[] = [
@@ -2672,10 +3012,21 @@ final class memhelper
     //  Internal — frontmatter, slugs, paths
     // ====================================================================
 
-    private function pathForSlug(string $slug): string
+    private function pathForSlug(string $slug, string $scope = ''): string
     {
         self::assertValidSlug($slug);
-        return $this->output . '/' . $slug . '.md';
+        if ($scope === '') {
+            return $this->output . '/' . $slug . '.md';
+        }
+        return $this->output . '/.scopes/' . hash('sha256', $scope) . '/' . $slug . '.md';
+    }
+
+    /**
+     * Build an internal state key while preserving legacy global keys.
+     */
+    private static function stateSlug(string $slug, string $scope): string
+    {
+        return $scope === '' ? $slug : 'scoped:' . hash('sha256', $scope) . ':' . $slug;
     }
 
     private static function assertValidSlug(string $slug): void
