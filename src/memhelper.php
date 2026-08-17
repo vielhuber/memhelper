@@ -2824,7 +2824,8 @@ final class memhelper
             cli_ssh_port: isset($this->aiConfig['cli_ssh_port']) && is_numeric($this->aiConfig['cli_ssh_port'])
                 ? (int) $this->aiConfig['cli_ssh_port']
                 : null,
-            cli_ssh_key: $sshKey !== '' ? $sshKey : null
+            cli_ssh_key: $sshKey !== '' ? $sshKey : null,
+            cli_native_memory: false
         );
         $result = $ai->ask(prompt: $prompt);
         if (!($result['success'] ?? false)) {
