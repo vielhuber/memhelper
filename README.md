@@ -21,10 +21,8 @@ ai:
     provider: openai
     model: gpt-5
     api_key: sk-...
-    cli_ssh_host:
-    cli_ssh_user:
-    cli_ssh_port:
-    cli_ssh_key:
+    cli_session_home: /persistent/harness/sessions/memory
+    cli_auth_home: /persistent/harness/profiles/codex
 
 output: /path/to/memory
 max_source_bytes: 20000
@@ -68,6 +66,10 @@ input_dbs:
       password:
       database: database
 ```
+
+`cli_session_home` and `cli_auth_home` are only relevant when `ai.provider` is a CLI harness such as Codex,
+Claude Code or OpenCode. The session home isolates Memhelper's native CLI history and configuration. The auth home
+points at the persistent login profile that may be shared with other sessions. API providers ignore both options.
 
 ## usage
 

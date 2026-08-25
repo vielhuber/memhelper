@@ -351,18 +351,16 @@ final class Test extends TestCase
         $this->assertNull($distilledAt);
     }
 
-    /** Preserve remote harness transport settings for AIHelper calls. */
-    public function testHarnessSshConfigurationIsLoaded(): void
+    /** Preserve separate harness session and authentication stores for AIHelper calls. */
+    public function testHarnessStoreConfigurationIsLoaded(): void
     {
         file_put_contents($this->cfgPath, implode("\n", [
             'output: ' . $this->tmpDir,
             'ai:',
             '    provider: codex',
             '    model: gpt-5.6-sol',
-            '    cli_ssh_host: host.docker.internal',
-            '    cli_ssh_user: root',
-            '    cli_ssh_port: 22',
-            '    cli_ssh_key: /host/data/ssh/harness',
+            '    cli_session_home: /host/data/harness/chats/memory',
+            '    cli_auth_home: /host/data/harness/profiles/codex',
             ''
         ]));
         $memory = $this->mem();
@@ -371,10 +369,8 @@ final class Test extends TestCase
         $this->assertSame([
             'provider' => 'codex',
             'model' => 'gpt-5.6-sol',
-            'cli_ssh_host' => 'host.docker.internal',
-            'cli_ssh_user' => 'root',
-            'cli_ssh_port' => 22,
-            'cli_ssh_key' => '/host/data/ssh/harness'
+            'cli_session_home' => '/host/data/harness/chats/memory',
+            'cli_auth_home' => '/host/data/harness/profiles/codex'
         ], $configuration->getValue($memory));
     }
 

@@ -2811,20 +2811,13 @@ final class memhelper
     private function callAi(string $prompt): string
     {
         $apiKey = (string) ($this->aiConfig['api_key'] ?? '');
-        $sshHost = (string) ($this->aiConfig['cli_ssh_host'] ?? '');
-        $sshUser = (string) ($this->aiConfig['cli_ssh_user'] ?? '');
-        $sshKey = (string) ($this->aiConfig['cli_ssh_key'] ?? '');
         $ai = aihelper::create(
             provider: (string) $this->aiConfig['provider'],
             model: (string) $this->aiConfig['model'],
             api_key: $apiKey !== '' ? $apiKey : null,
             max_tries: 3,
-            cli_ssh_host: $sshHost !== '' ? $sshHost : null,
-            cli_ssh_user: $sshUser !== '' ? $sshUser : null,
-            cli_ssh_port: isset($this->aiConfig['cli_ssh_port']) && is_numeric($this->aiConfig['cli_ssh_port'])
-                ? (int) $this->aiConfig['cli_ssh_port']
-                : null,
-            cli_ssh_key: $sshKey !== '' ? $sshKey : null,
+            cli_session_home: trim((string) ($this->aiConfig['cli_session_home'] ?? '')) ?: null,
+            cli_auth_home: trim((string) ($this->aiConfig['cli_auth_home'] ?? '')) ?: null,
             cli_native_memory: false
         );
         $result = $ai->ask(prompt: $prompt);
