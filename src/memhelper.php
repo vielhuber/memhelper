@@ -2788,8 +2788,8 @@ final class memhelper
             ? $this->output . '/*.md'
             : dirname($this->pathForSlug('placeholder', $scope)) . '/*.md';
         foreach (glob($pattern) ?: [] as $file) {
-            $head = (string) file_get_contents($file, false, null, 0, 4096);
-            [$fm] = self::splitFrontmatter($head);
+            $raw = (string) file_get_contents($file);
+            [$fm] = self::splitFrontmatter($raw);
             $out[] = [
                 'slug' => basename($file, '.md'),
                 'description' => (string) ($fm['description'] ?? ''),
