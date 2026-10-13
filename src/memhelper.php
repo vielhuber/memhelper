@@ -2853,9 +2853,14 @@ final class memhelper
             $raw = trim($raw);
         }
         // first try: outer-most json array
-        $start = strpos($raw, '[');
+        $arrayStart = strpos($raw, '[');
+        $start = $arrayStart;
         $end = strrpos($raw, ']');
-        if ($start !== false && $end !== false && $end > $start) {
+        $objectStart = strpos($raw, '{');
+        if (
+            $start !== false && $end !== false && $end > $start &&
+            ($objectStart === false || $start < $objectStart)
+        ) {
             $decoded = json_decode(substr($raw, $start, $end - $start + 1), true);
             if (is_array($decoded)) {
                 return $decoded;
@@ -2863,9 +2868,12 @@ final class memhelper
         }
         // second try: outer-most json object — some providers wrap the array
         // in {"actions": [...]}, {"diff": [...]} or {"facts": [...]}.
-        $start = strpos($raw, '{');
+        $start = $objectStart;
         $end = strrpos($raw, '}');
-        if ($start !== false && $end !== false && $end > $start) {
+        if (
+            $start !== false && $end !== false && $end > $start &&
+            ($arrayStart === false || $start < $arrayStart)
+        ) {
             $decoded = json_decode(substr($raw, $start, $end - $start + 1), true);
             if (is_array($decoded)) {
                 foreach (['actions', 'diff', 'facts', 'entries', 'memories', 'items'] as $key) {
@@ -2879,7 +2887,7 @@ final class memhelper
                 }
             }
         }
-        return [];
+        throw new RuntimeException('memhelper: ai response does not contain a valid diff');
     }
 
     // ====================================================================
