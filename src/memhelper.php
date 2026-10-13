@@ -843,10 +843,10 @@ final class memhelper
         }
     }
 
-    /** Extract `[[slug]]` references from a memory body. */
+    /** Extract wiki-link targets independently of their display labels. */
     private static function parseLinkTargets(string $body): array
     {
-        if (!preg_match_all('/\[\[([a-z0-9][a-z0-9_-]{0,127})\]\]/', $body, $m)) {
+        if (!preg_match_all('/\[\[([a-z0-9][a-z0-9_-]{0,127})(?:\|[^\[\]\r\n]+)?\]\]/', $body, $m)) {
             return [];
         }
         return array_values(array_unique($m[1]));
